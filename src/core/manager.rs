@@ -169,11 +169,13 @@ async fn manager_loop(
                 output_name,
                 convert_to_mp4,
             } => {
-                let result =
-                    merge_folder(&state, request_id, folder, output_name, convert_to_mp4).await;
-                let _ = state
-                    .event_sender
-                    .send(TaskEvent::MergeFinished { request_id, result });
+                // 合并可能持续很久，必须在独立协程中执行，否则会阻塞整个管理循环。
+                let settings = state.settings.clone();
+                let event_sender = state.event_sender.clone();
+                tokio::spawn(async move {
+                    let result = merge_folder(&settings, folder, output_name, convert_to_mp4).await;
+                    let _ = event_sender.send(TaskEvent::MergeFinished { request_id, result });
+                });
             }
         }
     }
@@ -594,13 +596,12 @@ fn initial_snapshot(manifest: &TaskManifest) -> TaskSnapshot {
 }
 
 async fn merge_folder(
-    state: &ManagerState,
-    _request_id: u64,
+    settings: &RwLock<Settings>,
     folder: std::path::PathBuf,
     output_name: String,
     convert_to_mp4: bool,
 ) -> Result<crate::core::merge::MergeResult, String> {
-    let settings = read_settings(&state.settings);
+    let settings = read_settings(settings);
     let scan = scan_merge_folder(&folder)
         .await
         .map_err(|error| error.user_message())?;

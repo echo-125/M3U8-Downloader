@@ -119,8 +119,8 @@ pub async fn scan_merge_folder(folder: &Path) -> Result<MergeScanResult, CoreErr
     }
     paths.sort_by(|left, right| {
         natural_compare(
-            &left.file_name().unwrap().to_string_lossy(),
-            &right.file_name().unwrap().to_string_lossy(),
+            &left.file_name().unwrap_or_default().to_string_lossy(),
+            &right.file_name().unwrap_or_default().to_string_lossy(),
         )
     });
 
@@ -130,7 +130,11 @@ pub async fn scan_merge_folder(folder: &Path) -> Result<MergeScanResult, CoreErr
         initialization: None,
     };
     for path in paths {
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if name.eq_ignore_ascii_case("init.mp4") || name.eq_ignore_ascii_case("init.m4s") {
             result.initialization = Some(path);
             continue;

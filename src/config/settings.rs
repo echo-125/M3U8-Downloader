@@ -228,6 +228,7 @@ impl Settings {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|_| ConfigError::Save)?;
         }
+        // 写入规范化后的配置：下载路径为空时补默认值，代理主机与 ffmpeg 路径去掉首尾空格。
         let content = serde_json::to_string_pretty(&normalized).map_err(|_| ConfigError::Save)?;
         fs::write(path, content).map_err(|_| ConfigError::Save)
     }
@@ -264,8 +265,9 @@ impl Settings {
                 return Err(ConfigError::Validation("启用代理时端口必须有效".into()));
             }
         }
-        if self.logging.max_gui_entries != 500 {
-            return Err(ConfigError::Validation("GUI 日志容量固定为 500 条".into()));
+        // GUI 日志容量固定，界面不可编辑，手工改成其他值时纠正而不是丢弃整份配置。
+        if self.logging.max_gui_entries != crate::logging::MAX_GUI_ENTRIES {
+            self.logging.max_gui_entries = crate::logging::MAX_GUI_ENTRIES;
         }
         if self.logging.max_size_mb == 0 || self.logging.max_size_mb > 100 {
             return Err(ConfigError::Validation(

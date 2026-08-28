@@ -51,7 +51,10 @@ impl eframe::App for CatCatchApp {
         render(ctx, &mut self.state);
         self.process_tray(ctx);
         self.handle_close_request(ctx);
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // 只在有任务在跑或有 Toast 需要消失时高频重绘，空闲时降低到 1 秒一次。
+        let idle = self.state.active_task_count() == 0 && self.state.toast.is_none();
+        let interval = if idle { 1000 } else { 200 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }
 }
 
