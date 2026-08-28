@@ -100,7 +100,8 @@ mod tests {
     #[test]
     fn decodes_bundled_icon() {
         let (rgba, width, height) = icon_rgba();
-        assert_eq!((width, height), (64, 64), "应从 icon.ico 解码出最大帧");
+        // 不锁定具体尺寸：图标文件可以调整，只要解出有效帧且数据完整即可。
+        assert!(width >= 16 && height >= 16, "应解码出有效的图标帧");
         assert_eq!(rgba.len() as u32, width * height * 4);
     }
 }

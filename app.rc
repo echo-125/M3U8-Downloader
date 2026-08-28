@@ -1,0 +1,2 @@
+// exe 图标资源，icon.ico 与托盘共用同一份资源文件。
+1 ICON "assets/icon.ico"
