@@ -53,6 +53,8 @@ impl CatCatchApp {
     fn request_exit(&mut self, ctx: &egui::Context) {
         if self.state.active_task_count() > 0 {
             self.state.request_exit_confirmation();
+            // 先恢复窗口再弹确认框：托盘退出时窗口可能处于最小化状态。
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             return;
         }
@@ -117,6 +119,8 @@ impl CatCatchApp {
         match action {
             TrayAction::Show => {
                 self.state.show_exit_confirmation = false;
+                // 最小化状态下恢复：先取消最小化再显示。
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
             TrayAction::Exit => self.request_exit(ctx),
@@ -133,7 +137,9 @@ impl CatCatchApp {
             self.state.request_exit_confirmation();
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         } else {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            // 最小化到托盘。注意不能用隐藏：隐藏后 egui 帧循环会停止，
+            // 托盘「显示」和「退出」的事件再也轮询不到，程序会一直卡住。
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
     }
 }

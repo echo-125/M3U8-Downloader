@@ -240,15 +240,15 @@ impl AppState {
         }
     }
 
-    pub fn save_settings(&mut self) {
+    pub fn save_settings(&mut self) -> bool {
         let mut settings = self.settings.clone();
         if let Err(error) = settings.validate() {
             self.notify_error(format!("设置保存失败：{error}"));
-            return;
+            return false;
         }
         if let Err(error) = settings.save(Some(&self.config_path)) {
             self.notify_error(format!("设置保存失败：{error}"));
-            return;
+            return false;
         }
         self.settings = settings;
         self.settings_before_edit = Some(self.settings.clone());
@@ -256,6 +256,9 @@ impl AppState {
             .send(TaskCommand::UpdateSettings(self.settings.clone()));
         self.manager.send(TaskCommand::DetectFfmpeg);
         self.logs.push_info("设置已保存");
+        // 保存后给出明确反馈，避免用户以为按钮没反应。
+        self.show_toast("设置已保存", false);
+        true
     }
 
     pub fn reset_settings(&mut self) {

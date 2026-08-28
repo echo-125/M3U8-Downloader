@@ -793,6 +793,8 @@ fn render_log_area(ui: &mut egui::Ui, state: &mut AppState) {
 
 fn render_settings_window(ctx: &egui::Context, state: &mut AppState) {
     let mut open = state.settings_open;
+    // 保存设置成功后由这里关闭窗口，见下方按钮处理。
+    let mut close_after_save = false;
     if open && state.settings_before_edit.is_none() {
         state.settings_before_edit = Some(state.settings.clone());
     }
@@ -982,8 +984,10 @@ fn render_settings_window(ctx: &egui::Context, state: &mut AppState) {
                 ui.set_width(SETTINGS_CONTENT_WIDTH);
                 // 主操作固定在右下角，位置稳定便于连续操作。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if primary_button(ui, true, "保存设置").clicked() {
-                        state.save_settings();
+                    // 保存成功后关闭窗口。不能直接改 open：.open(&mut open) 与闭包
+                    // 对 open 的借用冲突，这里只置标志，show 结束后统一处理。
+                    if primary_button(ui, true, "保存设置").clicked() && state.save_settings() {
+                        close_after_save = true;
                     }
                     if ui.button("恢复默认").clicked() {
                         state.reset_settings();
@@ -996,6 +1000,9 @@ fn render_settings_window(ctx: &egui::Context, state: &mut AppState) {
                 });
             });
 
+        if close_after_save {
+            open = false;
+        }
         if mask_clicked {
             open = false;
         }
