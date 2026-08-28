@@ -13,13 +13,15 @@ use std::time::Instant;
 
 use eframe::egui::{self, ViewportCommand};
 
-use crate::config::Settings;
+use crate::config::{Settings, ThemeKind};
 
 pub struct CatCatchApp {
     state: AppState,
     tray: Option<TrayController>,
     window_size_dirty: bool,
     last_window_size_saved: Instant,
+    /// 已应用到 egui 的主题。样式只在主题变化时重建，避免每帧失效文本布局缓存。
+    applied_theme: Option<ThemeKind>,
 }
 
 impl CatCatchApp {
@@ -44,12 +46,13 @@ impl CatCatchApp {
             tray,
             window_size_dirty: false,
             last_window_size_saved: Instant::now(),
+            applied_theme: None,
         }
     }
 
     fn request_exit(&mut self, ctx: &egui::Context) {
         if self.state.active_task_count() > 0 {
-            self.state.show_exit_confirmation = true;
+            self.state.request_exit_confirmation();
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             return;
         }
@@ -62,7 +65,11 @@ impl eframe::App for CatCatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.process_events();
         self.state.expire_toast();
-        apply(ctx, self.state.settings.appearance.theme);
+        let theme = self.state.settings.appearance.theme;
+        if self.applied_theme != Some(theme) {
+            apply(ctx, theme);
+            self.applied_theme = Some(theme);
+        }
         render(ctx, &mut self.state);
         self.process_tray(ctx);
         self.handle_close_request(ctx);
@@ -92,6 +99,8 @@ impl CatCatchApp {
         }
         if self.window_size_dirty
             && self.last_window_size_saved.elapsed() >= std::time::Duration::from_secs(2)
+            // 设置窗口打开期间内存里的配置只是草稿，此时写盘会把未保存的修改固化下来。
+            && self.state.settings_before_edit.is_none()
         {
             self.state.persist_settings();
             self.window_size_dirty = false;
@@ -121,7 +130,7 @@ impl CatCatchApp {
         }
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
         if self.state.active_task_count() > 0 {
-            self.state.show_exit_confirmation = true;
+            self.state.request_exit_confirmation();
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         } else {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));

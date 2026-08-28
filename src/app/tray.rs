@@ -24,11 +24,12 @@ impl TrayController {
         let menu = Menu::new();
         menu.append_items(&[&show_item, &exit_item])
             .map_err(|_| "创建托盘菜单失败".to_string())?;
-        let icon = tray_icon::Icon::from_rgba(icon_rgba(), 32, 32)
+        let (rgba, width, height) = icon_rgba();
+        let icon = tray_icon::Icon::from_rgba(rgba, width, height)
             .map_err(|_| "创建托盘图标失败".to_string())?;
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Cat Catch Assistant")
+            .with_tooltip("M3U8下载器")
             .with_icon(icon)
             .build()
             .map_err(|_| "初始化系统托盘失败".to_string())?;
@@ -55,7 +56,26 @@ impl TrayController {
     }
 }
 
-pub fn icon_rgba() -> Vec<u8> {
+/// 应用图标：优先从内置的 icon.ico 解码（自动选最大帧），失败时退回生成图标。
+pub fn icon_rgba() -> (Vec<u8>, u32, u32) {
+    let bytes: &[u8] = include_bytes!("../../assets/icon.ico");
+    if let Some(icon) = decode_ico(bytes) {
+        return icon;
+    }
+    fallback_icon()
+}
+
+fn decode_ico(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    use image::ImageDecoder;
+    let decoder = image::codecs::ico::IcoDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions();
+    let mut rgba = vec![0_u8; (width * height * 4) as usize];
+    decoder.read_image(&mut rgba).ok()?;
+    Some((rgba, width, height))
+}
+
+/// 图标解码失败的兜底：圆形蓝色猫爪占位。
+fn fallback_icon() -> (Vec<u8>, u32, u32) {
     let mut rgba = Vec::with_capacity(32 * 32 * 4);
     for y in 0..32 {
         for x in 0..32 {
@@ -70,5 +90,17 @@ pub fn icon_rgba() -> Vec<u8> {
             rgba.extend_from_slice(&color);
         }
     }
-    rgba
+    (rgba, 32, 32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_bundled_icon() {
+        let (rgba, width, height) = icon_rgba();
+        assert_eq!((width, height), (64, 64), "应从 icon.ico 解码出最大帧");
+        assert_eq!(rgba.len() as u32, width * height * 4);
+    }
 }

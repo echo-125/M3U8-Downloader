@@ -12,6 +12,45 @@ const CJK_FONT_FILES: &[&str] = &[
     "Deng.ttf",
 ];
 
+/// 一套主题用到的配色，集中定义便于整体调整。
+struct Palette {
+    accent: egui::Color32,
+    panel: egui::Color32,
+    card: egui::Color32,
+    field: egui::Color32,
+    faint: egui::Color32,
+    widget: egui::Color32,
+    widget_hover: egui::Color32,
+    border: egui::Color32,
+}
+
+impl Palette {
+    fn new(theme: ThemeKind) -> Self {
+        match theme {
+            ThemeKind::Light => Self {
+                accent: egui::Color32::from_rgb(37, 118, 214),
+                panel: egui::Color32::from_rgb(244, 246, 249),
+                card: egui::Color32::WHITE,
+                field: egui::Color32::WHITE,
+                faint: egui::Color32::from_rgb(240, 243, 247),
+                widget: egui::Color32::WHITE,
+                widget_hover: egui::Color32::from_rgb(236, 243, 253),
+                border: egui::Color32::from_rgb(219, 225, 232),
+            },
+            ThemeKind::Dark => Self {
+                accent: egui::Color32::from_rgb(76, 154, 255),
+                panel: egui::Color32::from_rgb(27, 30, 36),
+                card: egui::Color32::from_rgb(36, 40, 48),
+                field: egui::Color32::from_rgb(21, 24, 29),
+                faint: egui::Color32::from_rgb(31, 34, 41),
+                widget: egui::Color32::from_rgb(42, 47, 56),
+                widget_hover: egui::Color32::from_rgb(50, 56, 66),
+                border: egui::Color32::from_rgb(56, 63, 74),
+            },
+        }
+    }
+}
+
 pub fn switch_label(theme: ThemeKind) -> &'static str {
     match theme {
         ThemeKind::Light => "切换到暗色",
@@ -57,10 +96,64 @@ fn windows_fonts_directory() -> PathBuf {
     }
 }
 
+/// 基于默认明暗视觉派生完整样式：加大字号、统一间距圆角，并注入强调色。
 pub fn apply(ctx: &egui::Context, theme: ThemeKind) {
-    let visuals = match theme {
-        ThemeKind::Light => egui::Visuals::light(),
-        ThemeKind::Dark => egui::Visuals::dark(),
+    let palette = Palette::new(theme);
+    let mut style = match theme {
+        ThemeKind::Light => egui::Style {
+            visuals: egui::Visuals::light(),
+            ..egui::Style::default()
+        },
+        ThemeKind::Dark => egui::Style {
+            visuals: egui::Visuals::dark(),
+            ..egui::Style::default()
+        },
     };
-    ctx.set_visuals(visuals);
+
+    style.text_styles = [
+        (egui::TextStyle::Heading, egui::FontId::proportional(20.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(15.0)),
+        (egui::TextStyle::Button, egui::FontId::proportional(15.0)),
+        (egui::TextStyle::Small, egui::FontId::proportional(12.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(13.0)),
+    ]
+    .into();
+
+    style.spacing.item_spacing = egui::vec2(10.0, 9.0);
+    // 输入框 margin 与按钮 padding 的纵向值保持一致，两者高度才会相等。
+    style.spacing.button_padding = egui::vec2(12.0, 5.0);
+    style.spacing.interact_size = egui::vec2(40.0, 30.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+
+    let visuals = &mut style.visuals;
+    visuals.panel_fill = palette.panel;
+    visuals.window_fill = palette.card;
+    visuals.extreme_bg_color = palette.field;
+    visuals.faint_bg_color = palette.faint;
+    visuals.window_rounding = egui::Rounding::same(10.0);
+    visuals.menu_rounding = egui::Rounding::same(8.0);
+    visuals.selection.bg_fill = palette.accent;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    visuals.hyperlink_color = palette.accent;
+
+    let widgets = &mut visuals.widgets;
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.rounding = egui::Rounding::same(6.0);
+    }
+    widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, palette.border);
+    widgets.inactive.bg_fill = palette.widget;
+    widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette.border);
+    widgets.hovered.bg_fill = palette.widget_hover;
+    widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette.accent);
+    widgets.active.bg_fill = palette.accent;
+    widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+
+    ctx.set_style(style);
 }

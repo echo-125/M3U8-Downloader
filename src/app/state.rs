@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     config::{default_config_path, ProxyScheme, Settings, ThemeKind},
     core::{
-        events::{CoreLogLevel, NewTask, TaskCommand, TaskEvent, TaskSnapshot},
+        events::{CoreLogLevel, NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
         manager::TaskManager,
         merge::{sanitize_filename, MergeScanResult},
         task::{TaskRegistry, TASK_REGISTRY_FILE_NAME},
@@ -66,6 +66,8 @@ pub struct AppState {
     pub selected_task_ids: Vec<u64>,
     pub toast: Option<Toast>,
     pub show_exit_confirmation: bool,
+    /// 弹出退出确认时的进行中任务数快照，任务在确认期间结束时文案不会跳到 0。
+    pub exit_confirmation_count: usize,
     pub edit_task: Option<EditTask>,
     pub allow_exit: bool,
     pub ffmpeg_status: Option<String>,
@@ -128,6 +130,7 @@ impl AppState {
             selected_task_ids: Vec::new(),
             toast: None,
             show_exit_confirmation: false,
+            exit_confirmation_count: 0,
             edit_task: None,
             allow_exit: false,
             ffmpeg_status: None,
@@ -149,6 +152,17 @@ impl AppState {
                     }
                     self.tasks.sort_by_key(|task| task.id);
                 }
+                TaskEvent::TasksRemoved { ids } => {
+                    self.tasks.retain(|task| !ids.contains(&task.id));
+                    self.selected_task_ids.retain(|id| !ids.contains(id));
+                    if self
+                        .edit_task
+                        .as_ref()
+                        .is_some_and(|edit| ids.contains(&edit.id))
+                    {
+                        self.edit_task = None;
+                    }
+                }
                 TaskEvent::Log { level, message } => {
                     let level = match level {
                         CoreLogLevel::Info => LogLevel::Info,
@@ -158,11 +172,7 @@ impl AppState {
                     self.logs.push(level, message);
                 }
                 TaskEvent::Toast { message, error } => {
-                    self.toast = Some(Toast {
-                        message,
-                        error,
-                        expires_at: Instant::now() + std::time::Duration::from_millis(3500),
-                    });
+                    self.show_toast(message, error);
                 }
                 TaskEvent::MergeScan { request_id, result } => {
                     if request_id == self.manual_request_id {
@@ -182,7 +192,7 @@ impl AppState {
                             }
                             Err(message) => {
                                 self.manual_scan = None;
-                                self.logs.push_error(message);
+                                self.notify_error(message);
                             }
                         }
                     }
@@ -195,21 +205,11 @@ impl AppState {
                                     "合并完成：{}",
                                     result.output_path.to_string_lossy()
                                 ));
-                                self.toast = Some(Toast {
-                                    message: "手动合并完成".to_string(),
-                                    error: false,
-                                    expires_at: Instant::now()
-                                        + std::time::Duration::from_millis(3500),
-                                });
+                                self.show_toast("手动合并完成", false);
                             }
                             Err(message) => {
                                 self.logs.push_error(format!("手动合并失败：{message}"));
-                                self.toast = Some(Toast {
-                                    message: format!("手动合并失败：{message}"),
-                                    error: true,
-                                    expires_at: Instant::now()
-                                        + std::time::Duration::from_millis(3500),
-                                });
+                                self.show_toast(format!("手动合并失败：{message}"), true);
                             }
                         }
                     }
@@ -232,11 +232,11 @@ impl AppState {
     pub fn save_settings(&mut self) {
         let mut settings = self.settings.clone();
         if let Err(error) = settings.validate() {
-            self.logs.push_error(format!("设置保存失败：{error}"));
+            self.notify_error(format!("设置保存失败：{error}"));
             return;
         }
         if let Err(error) = settings.save(Some(&self.config_path)) {
-            self.logs.push_error(format!("设置保存失败：{error}"));
+            self.notify_error(format!("设置保存失败：{error}"));
             return;
         }
         self.settings = settings;
@@ -269,8 +269,7 @@ impl AppState {
     pub fn add_single_task(&mut self) {
         let url = self.single_url.trim().to_string();
         if !is_valid_http_url(&url) {
-            self.logs
-                .push_error("任务添加失败：M3U8 链接必须是有效的 HTTP 或 HTTPS 地址");
+            self.notify_error("任务添加失败：M3U8 链接必须是有效的 HTTP 或 HTTPS 地址");
             return;
         }
         let output_directory = self.output_directory(&self.single_path);
@@ -330,15 +329,14 @@ impl AppState {
             self.batch_text.clear();
         }
         if invalid > 0 {
-            self.logs
-                .push_error(format!("批量添加有 {invalid} 行无效，已跳过"));
+            self.notify_error(format!("批量添加有 {invalid} 行无效，已跳过"));
         }
     }
 
     pub fn scan_manual_folder(&mut self) {
         let folder = PathBuf::from(self.manual_folder.trim());
         if !folder.is_dir() {
-            self.logs.push_error("扫描失败：合并文件夹不存在");
+            self.notify_error("扫描失败：合并文件夹不存在");
             return;
         }
         self.manual_request_id = self.manager.next_request_id();
@@ -352,7 +350,7 @@ impl AppState {
     pub fn start_manual_merge(&mut self) {
         let folder = PathBuf::from(self.manual_folder.trim());
         if !folder.is_dir() {
-            self.logs.push_error("合并失败：文件夹不存在");
+            self.notify_error("合并失败：文件夹不存在");
             return;
         }
         let output_name = if self.manual_output_name.trim().is_empty() {
@@ -389,10 +387,6 @@ impl AppState {
         self.manager.send(TaskCommand::Cancel(id));
     }
 
-    pub fn retry_task(&mut self, id: u64) {
-        self.manager.send(TaskCommand::Retry(id));
-    }
-
     pub fn is_task_selected(&self, id: u64) -> bool {
         self.selected_task_ids.contains(&id)
     }
@@ -419,31 +413,45 @@ impl AppState {
         self.selected_task_ids = self.tasks.iter().map(|task| task.id).collect();
     }
 
+    /// 选中任务中状态满足条件的 id，保持原选中顺序。
+    pub fn selected_ids_where(&self, predicate: fn(TaskStatus) -> bool) -> Vec<u64> {
+        self.selected_task_ids
+            .iter()
+            .copied()
+            .filter(|id| self.status_of(*id).is_some_and(predicate))
+            .collect()
+    }
+
+    pub fn status_of(&self, id: u64) -> Option<TaskStatus> {
+        self.tasks
+            .iter()
+            .find(|task| task.id == id)
+            .map(|task| task.status)
+    }
+
     pub fn start_selected_tasks(&mut self) {
-        for id in self.selected_task_ids.clone() {
+        for id in self.selected_ids_where(TaskStatus::is_startable) {
             self.manager.send(TaskCommand::Start(id));
         }
     }
 
     pub fn cancel_selected_tasks(&mut self) {
-        for id in self.selected_task_ids.clone() {
+        for id in self.selected_ids_where(TaskStatus::is_cancelable) {
             self.manager.send(TaskCommand::Cancel(id));
         }
     }
 
     pub fn retry_selected_tasks(&mut self) {
-        for id in self.selected_task_ids.clone() {
+        for id in self.selected_ids_where(TaskStatus::is_startable) {
             self.manager.send(TaskCommand::Retry(id));
         }
     }
 
+    /// 只下发删除命令，界面行的移除等核心 `TasksRemoved` 事件确认后再进行。
     pub fn delete_selected_tasks(&mut self) {
-        let ids = self.selected_task_ids.clone();
-        for id in &ids {
-            self.manager.send(TaskCommand::Delete(*id));
+        for id in self.selected_task_ids.clone() {
+            self.manager.send(TaskCommand::Delete(id));
         }
-        self.tasks.retain(|task| !ids.contains(&task.id));
-        self.selected_task_ids.clear();
     }
 
     pub fn save_edited_task(&mut self) {
@@ -451,16 +459,15 @@ impl AppState {
             return;
         };
         if !is_valid_http_url(&edit.source_url) {
-            self.logs
-                .push_error("编辑失败：链接必须是有效的 HTTP 或 HTTPS 地址");
+            self.notify_error("编辑失败：链接必须是有效的 HTTP 或 HTTPS 地址");
             return;
         }
         if edit.output_name.trim().is_empty() {
-            self.logs.push_error("编辑失败：文件名不能为空");
+            self.notify_error("编辑失败：文件名不能为空");
             return;
         }
         if edit.output_directory.trim().is_empty() {
-            self.logs.push_error("编辑失败：保存路径不能为空");
+            self.notify_error("编辑失败：保存路径不能为空");
             return;
         }
         self.manager.send(TaskCommand::EditTask {
@@ -473,28 +480,20 @@ impl AppState {
         self.edit_task = None;
     }
 
-    pub fn delete_task(&mut self, id: u64) {
-        self.manager.send(TaskCommand::Delete(id));
-        self.tasks.retain(|task| task.id != id);
-        self.selected_task_ids.retain(|selected| *selected != id);
-    }
-
     /// 清除所有已结束的任务：已完成、已失败、已取消。
     pub fn clear_finished_tasks(&mut self) {
         self.manager.send(TaskCommand::ClearFinished);
-        self.tasks.retain(|task| task.status.is_active());
-        self.selected_task_ids.clear();
     }
 
     /// 从剪贴板粘贴任务信息，支持 `链接|文件名|请求头JSON` 的增强格式。
     pub fn paste_from_clipboard(&mut self) {
         let Some(text) = clipboard_text() else {
-            self.logs.push_error("粘贴失败：无法读取剪贴板");
+            self.notify_error("粘贴失败：无法读取剪贴板");
             return;
         };
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            self.logs.push_warning("剪贴板为空");
+            self.notify_error("粘贴失败：剪贴板为空");
             return;
         }
         let parts: Vec<&str> = trimmed.split('|').collect();
@@ -539,11 +538,11 @@ impl AppState {
             })
             .unwrap_or_else(|| PathBuf::from(&snapshot.output_directory));
         if !path.is_dir() {
-            self.logs.push_warning("目录不存在，无法打开");
+            self.notify_error("目录不存在，无法打开");
             return;
         }
         if Command::new("explorer.exe").arg(&path).spawn().is_err() {
-            self.logs.push_error("打开目录失败");
+            self.notify_error("打开目录失败");
         }
     }
 
@@ -565,6 +564,28 @@ impl AppState {
 
     pub fn set_proxy_scheme(&mut self, scheme: ProxyScheme) {
         self.settings.proxy.scheme = scheme;
+    }
+
+    /// 弹出一个 Toast，不额外写日志（调用方自行决定日志内容）。
+    pub fn show_toast(&mut self, message: impl Into<String>, error: bool) {
+        self.toast = Some(Toast {
+            message: message.into(),
+            error,
+            expires_at: Instant::now() + std::time::Duration::from_millis(3500),
+        });
+    }
+
+    /// 请求弹出退出确认，同时冻结当时的进行中任务数。
+    pub fn request_exit_confirmation(&mut self) {
+        self.exit_confirmation_count = self.active_task_count();
+        self.show_exit_confirmation = true;
+    }
+
+    /// 用户主动操作的失败提示：写错误日志并弹 Toast，确保错误能被注意到。
+    pub fn notify_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.logs.push_error(message.clone());
+        self.show_toast(message, true);
     }
 
     pub fn expire_toast(&mut self) {

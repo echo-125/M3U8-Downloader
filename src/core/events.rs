@@ -29,6 +29,17 @@ impl TaskStatus {
     pub fn is_active(self) -> bool {
         matches!(self, Self::Waiting | Self::Downloading | Self::Canceling)
     }
+
+    /// 可以开始或重试的状态。
+    /// 已完成任务不在其中：核心启动已完成任务会重置 manifest，导致重新下载并覆盖已有成品。
+    pub fn is_startable(self) -> bool {
+        matches!(self, Self::Waiting | Self::Failed | Self::Canceled)
+    }
+
+    /// 可以取消的状态。取消中重复下发取消命令是幂等的，因此一并按可取消处理。
+    pub fn is_cancelable(self) -> bool {
+        self.is_active()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +109,10 @@ pub enum TaskCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskEvent {
     Snapshot(TaskSnapshot),
+    /// 核心已删除任务，界面据此移除对应行，避免界面先移除而核心删除失败造成状态不一致。
+    TasksRemoved {
+        ids: Vec<u64>,
+    },
     Log {
         level: CoreLogLevel,
         message: String,
@@ -127,5 +142,15 @@ mod tests {
     fn active_statuses_are_correct() {
         assert!(TaskStatus::Waiting.is_active());
         assert!(!TaskStatus::Failed.is_active());
+    }
+
+    #[test]
+    fn completed_tasks_are_not_startable() {
+        // 已完成任务不可重新开始：核心启动已完成任务会重置 manifest，重新下载并覆盖已有成品。
+        assert!(TaskStatus::Waiting.is_startable());
+        assert!(TaskStatus::Failed.is_startable());
+        assert!(TaskStatus::Canceled.is_startable());
+        assert!(!TaskStatus::Completed.is_startable());
+        assert!(!TaskStatus::Downloading.is_startable());
     }
 }

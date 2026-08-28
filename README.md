@@ -1,4 +1,4 @@
-# Cat Catch Assistant
+# M3U8下载器
 
 用 Rust 重写的 M3U8 视频下载器，Windows 桌面图形界面，发布形态为便携版单 exe。
 
@@ -72,7 +72,7 @@
 # 调试运行
 cargo run
 
-# 发布构建，产物为 target\release\cat-catch-assistant.exe
+# 发布构建，产物为 target\release\M3U8下载器.exe
 cargo build --release
 ```
 

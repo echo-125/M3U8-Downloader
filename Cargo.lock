@@ -706,6 +706,7 @@ dependencies = [
  "eframe",
  "encoding_rs",
  "futures-util",
+ "image",
  "reqwest",
  "rfd",
  "serde",

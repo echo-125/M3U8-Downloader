@@ -441,7 +441,7 @@ fn start_all_tasks(state: &ManagerState) {
         .map(|tasks| {
             tasks
                 .values()
-                .filter(|runtime| !runtime.snapshot.status.is_active())
+                .filter(|runtime| runtime.snapshot.status.is_startable())
                 .map(|runtime| runtime.manifest.id)
                 .collect()
         })
@@ -474,6 +474,10 @@ fn delete_task(state: &ManagerState, id: u64) {
         .ok()
         .and_then(|mut tasks| tasks.remove(&id));
     let Some(runtime) = removed else {
+        // 任务已不存在时也要通知界面移除对应行，否则会残留一个永远无法操作的幽灵任务。
+        let _ = state
+            .event_sender
+            .send(TaskEvent::TasksRemoved { ids: vec![id] });
         return;
     };
     runtime.cancellation_token.cancel();
@@ -489,6 +493,9 @@ fn delete_task(state: &ManagerState, id: u64) {
         level: CoreLogLevel::Info,
         message: format!("任务已删除：{}", runtime.manifest.output_name),
     });
+    let _ = state
+        .event_sender
+        .send(TaskEvent::TasksRemoved { ids: vec![id] });
 }
 
 fn edit_task(
@@ -632,6 +639,7 @@ fn clear_finished_tasks(state: &ManagerState) {
     if removed.is_empty() {
         return;
     }
+    let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
     let mut dismissed = 0;
     for runtime in &removed {
         runtime.cancellation_token.cancel();
@@ -657,6 +665,7 @@ fn clear_finished_tasks(state: &ManagerState) {
             dismissed
         ),
     });
+    let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
 }
 
 fn resume_tasks(state: &ManagerState, directories: Vec<PathBuf>) {

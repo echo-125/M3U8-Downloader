@@ -23,6 +23,8 @@ impl LogLevel {
 pub struct LogEntry {
     pub level: LogLevel,
     pub message: String,
+    /// 产生时间，格式 HH:MM:SS，用于界面展示。
+    pub time: String,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +44,7 @@ impl LogBuffer {
         self.entries.push_back(LogEntry {
             level,
             message: message.into(),
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
         });
     }
 

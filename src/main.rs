@@ -27,7 +27,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Cat Catch Assistant",
+        "M3U8下载器",
         options,
         Box::new(move |creation_context| {
             Ok(Box::new(CatCatchApp::new(
@@ -40,10 +40,10 @@ fn main() -> eframe::Result {
 }
 
 fn load_icon() -> std::sync::Arc<eframe::egui::IconData> {
-    let rgba = crate::app::tray::icon_rgba();
+    let (rgba, width, height) = crate::app::tray::icon_rgba();
     std::sync::Arc::new(eframe::egui::IconData {
         rgba,
-        width: 32,
-        height: 32,
+        width,
+        height,
     })
 }
