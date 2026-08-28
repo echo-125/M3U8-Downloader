@@ -68,6 +68,8 @@ pub struct AppState {
     pub show_exit_confirmation: bool,
     /// 弹出退出确认时的进行中任务数快照，任务在确认期间结束时文案不会跳到 0。
     pub exit_confirmation_count: usize,
+    /// 清空任务列表前的二次确认弹窗。
+    pub show_clear_confirmation: bool,
     pub edit_task: Option<EditTask>,
     pub allow_exit: bool,
     pub ffmpeg_status: Option<String>,
@@ -131,6 +133,7 @@ impl AppState {
             toast: None,
             show_exit_confirmation: false,
             exit_confirmation_count: 0,
+            show_clear_confirmation: false,
             edit_task: None,
             allow_exit: false,
             ffmpeg_status: None,
@@ -298,6 +301,7 @@ impl AppState {
             output_directory,
             max_workers: self.single_workers.clamp(1, 64),
             request_headers: self.single_headers.trim().to_string(),
+            auto_start: true,
         }));
         self.single_url.clear();
         self.single_name.clear();
@@ -307,7 +311,7 @@ impl AppState {
         let text = self.batch_text.clone();
         let output_directory = self.output_directory(&self.batch_path);
         let max_workers = self.settings.max_workers;
-        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers);
+        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, true);
         if valid > 0 {
             self.logs
                 .push_info(format!("批量添加完成：成功 {valid} 个"));
@@ -330,9 +334,10 @@ impl AppState {
             return;
         }
         // 按钮在单个任务页，因此沿用该页的保存路径与线程数。
+        // 粘贴添加不自动开始：批量内容可能包含用户想先检查的链接，保持「等待中」。
         let output_directory = self.output_directory(&self.single_path);
         let max_workers = self.single_workers.clamp(1, 64);
-        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers);
+        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, false);
         if valid == 0 {
             self.show_toast(
                 "粘贴添加失败：剪贴板中没有符合格式的内容\n格式为 链接|文件名 或 链接|文件名|请求头JSON",
@@ -353,6 +358,7 @@ impl AppState {
         text: &str,
         output_directory: PathBuf,
         max_workers: usize,
+        auto_start: bool,
     ) -> (usize, Vec<String>) {
         let mut valid = 0;
         let mut errors = Vec::new();
@@ -376,6 +382,7 @@ impl AppState {
                 output_directory: output_directory.clone(),
                 max_workers,
                 request_headers,
+                auto_start,
             }));
             valid += 1;
         }
@@ -447,20 +454,17 @@ impl AppState {
         self.manager.send(TaskCommand::StartAll);
     }
 
-    pub fn cancel_task(&mut self, id: u64) {
-        self.manager.send(TaskCommand::Cancel(id));
+    /// 重置单个任务：停止下载、删除已下载的分片、恢复等待中。
+    pub fn reset_single_task(&mut self, id: u64) {
+        self.manager.send(TaskCommand::Reset(vec![id]));
     }
 
     pub fn is_task_selected(&self, id: u64) -> bool {
         self.selected_task_ids.contains(&id)
     }
 
-    /// 按住 Ctrl 或 Shift 点击为增减选择，否则只选中当前行。
-    pub fn select_task(&mut self, id: u64, additive: bool) {
-        if !additive {
-            self.selected_task_ids = vec![id];
-            return;
-        }
+    /// 点击行切换勾选状态，作为批量操作的选中集合。
+    pub fn toggle_check(&mut self, id: u64) {
         match self
             .selected_task_ids
             .iter()
@@ -475,6 +479,11 @@ impl AppState {
 
     pub fn select_all_tasks(&mut self) {
         self.selected_task_ids = self.tasks.iter().map(|task| task.id).collect();
+    }
+
+    /// 取消全部勾选。
+    pub fn clear_checks(&mut self) {
+        self.selected_task_ids.clear();
     }
 
     /// 选中任务中状态满足条件的 id，保持原选中顺序。
@@ -499,9 +508,11 @@ impl AppState {
         }
     }
 
+    /// 取消勾选任务：停止下载、删除已下载分片、恢复「等待中」，不保留断点续传。
     pub fn cancel_selected_tasks(&mut self) {
-        for id in self.selected_ids_where(TaskStatus::is_cancelable) {
-            self.manager.send(TaskCommand::Cancel(id));
+        let ids = self.selected_ids_where(TaskStatus::is_cancelable);
+        if !ids.is_empty() {
+            self.manager.send(TaskCommand::Reset(ids));
         }
     }
 
@@ -516,6 +527,11 @@ impl AppState {
         for id in self.selected_task_ids.clone() {
             self.manager.send(TaskCommand::Delete(id));
         }
+    }
+
+    /// 移除所有已完成和已失败的任务（界面「删除」按钮，无视勾选）。
+    pub fn remove_finished_tasks(&mut self) {
+        self.manager.send(TaskCommand::RemoveFinished);
     }
 
     pub fn save_edited_task(&mut self) {

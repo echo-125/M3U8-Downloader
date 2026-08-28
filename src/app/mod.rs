@@ -123,7 +123,16 @@ impl CatCatchApp {
                 ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
-            TrayAction::Exit => self.request_exit(ctx),
+            TrayAction::Exit => {
+                // 窗口最小化驻留托盘时，Close 命令对隐藏窗口不生效——帧循环虽在运行，
+                // winit 不会给最小化窗口派发关闭事件，走正常流程会一直挂着。
+                // 此时直接退出进程：任务状态随变化即时落盘，文件日志逐行 flush，不丢数据。
+                let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+                if minimized {
+                    std::process::exit(0);
+                }
+                self.request_exit(ctx);
+            }
         }
     }
 

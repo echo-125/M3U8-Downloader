@@ -31,10 +31,10 @@ const SETTINGS_SCROLL_MAX_HEIGHT: f32 = 450.0;
 /// 编辑任务窗口内容区宽度。
 const EDIT_CONTENT_WIDTH: f32 = 520.0;
 
-/// 任务列表四列的宽度比例：文件名 / 状态 / 进度 / 速度信息。
+/// 任务列表五列的宽度比例：勾选 / 文件名 / 状态 / 进度 / 速度信息。
 /// 固定比例而非按内容自适应，否则速度和剩余时间每帧变化会让列宽持续抖动。
-const TASK_COLUMN_RATIOS: [f32; 4] = [0.32, 0.12, 0.26, 0.30];
-const TASK_COLUMN_TITLES: [&str; 4] = ["文件名", "状态", "进度", "速度 / 信息"];
+const TASK_COLUMN_RATIOS: [f32; 5] = [0.07, 0.28, 0.11, 0.26, 0.28];
+const TASK_COLUMN_TITLES: [&str; 5] = ["勾选", "文件名", "状态", "进度", "速度 / 信息"];
 /// 任务行高固定，行高不随内容变化。
 const TASK_ROW_HEIGHT: f32 = 28.0;
 const TASK_COLUMN_SPACING: f32 = 10.0;
@@ -72,6 +72,7 @@ pub fn render(ctx: &egui::Context, state: &mut AppState) {
     render_settings_window(ctx, state);
     render_edit_window(ctx, state);
     render_exit_confirmation(ctx, state);
+    render_clear_confirmation(ctx, state);
     render_toast(ctx, state);
 }
 
@@ -490,11 +491,11 @@ fn render_manual_merge_form(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-/// 按可用宽度和固定比例算出四列宽度。
-fn task_column_widths(total_width: f32) -> [f32; 4] {
+/// 按可用宽度和固定比例算出五列宽度。
+fn task_column_widths(total_width: f32) -> [f32; 5] {
     let spacing = TASK_COLUMN_SPACING * (TASK_COLUMN_RATIOS.len() - 1) as f32;
     let usable = (total_width - spacing).max(0.0);
-    let mut widths = [0.0; 4];
+    let mut widths = [0.0; 5];
     for (index, ratio) in TASK_COLUMN_RATIOS.iter().enumerate() {
         widths[index] = usable * ratio;
     }
@@ -509,13 +510,15 @@ fn selection_row_color(ui: &egui::Ui) -> Color32 {
 
 /// 渲染一行固定列宽的表格内容，并绘制斑马纹或选中背景。
 /// 每列宽度由调用方给定，控件一律撑满所在列，不反向影响布局。
+/// 返回整行是否被点击（用于切换勾选）；表头行传 `interactive: false`。
 fn task_table_row<R>(
     ui: &mut egui::Ui,
-    widths: &[f32; 4],
+    widths: &[f32; 5],
     row_index: usize,
     selected: bool,
+    interactive: bool,
     mut content: impl FnMut(&mut egui::Ui, usize) -> R,
-) {
+) -> bool {
     let total = widths.iter().sum::<f32>() + TASK_COLUMN_SPACING * (widths.len() - 1) as f32;
     // 背景用 painter 先画，不占用布局空间，随后 horizontal 会落在同一位置。
     let row_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, TASK_ROW_HEIGHT));
@@ -529,6 +532,17 @@ fn task_table_row<R>(
     if let Some(color) = background {
         ui.painter().rect_filled(row_rect.expand(2.0), 4.0, color);
     }
+    // 整行点击区域：点击行任意位置切换勾选。
+    let row_clicked = if interactive {
+        ui.interact(
+            row_rect,
+            ui.id().with(("task_row", row_index)),
+            egui::Sense::click(),
+        )
+        .clicked()
+    } else {
+        false
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = TASK_COLUMN_SPACING;
         for (column, width) in widths.iter().enumerate() {
@@ -539,11 +553,11 @@ fn task_table_row<R>(
             );
         }
     });
+    row_clicked
 }
 
 fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
     card(ui, "任务列表", |ui| {
-        let has_selection = !state.selected_task_ids.is_empty();
         let startable_selected = !state
             .selected_ids_where(TaskStatus::is_startable)
             .is_empty();
@@ -551,6 +565,12 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
             .selected_ids_where(TaskStatus::is_cancelable)
             .is_empty();
         let any_startable = state.tasks.iter().any(|task| task.status.is_startable());
+        let has_finished = state
+            .tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::Completed | TaskStatus::Failed));
+        let all_checked =
+            !state.tasks.is_empty() && state.selected_task_ids.len() == state.tasks.len();
 
         ui.horizontal(|ui| {
             if primary_button(ui, startable_selected, "开始").clicked() {
@@ -572,27 +592,55 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
             {
                 state.retry_selected_tasks();
             }
+            // 删除：无视勾选，移除所有已完成/已失败任务。
             if ui
-                .add_enabled(has_selection, egui::Button::new("删除"))
+                .add_enabled(has_finished, egui::Button::new("删除"))
                 .clicked()
             {
-                state.delete_selected_tasks();
-            }
-            if !state.tasks.is_empty() && ui.button("全选").clicked() {
-                state.select_all_tasks();
+                state.remove_finished_tasks();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("清除已结束").clicked() {
-                    state.clear_finished_tasks();
+                if !state.tasks.is_empty() && ui.button("全选").clicked() {
+                    // 已全部勾选时再点一次取消全选。
+                    if state.selected_task_ids.len() == state.tasks.len() {
+                        state.clear_checks();
+                    } else {
+                        state.select_all_tasks();
+                    }
+                }
+                if !state.tasks.is_empty() && ui.button("清空").clicked() {
+                    state.show_clear_confirmation = true;
                 }
             });
         });
         ui.add_space(2.0);
 
         let widths = task_column_widths(ui.available_width());
-        task_table_row(ui, &widths, 0, false, |ui, column| {
-            ui.strong(TASK_COLUMN_TITLES[column])
+        // 表头：勾选列是全选 checkbox，其余列是标题。
+        let mut toggle_all = false;
+        task_table_row(ui, &widths, 0, false, false, |ui, column| match column {
+            0 => {
+                if state.tasks.is_empty() {
+                    // 无任务时表头不显示全选框，避免看起来像一行空任务。
+                    ui.strong(TASK_COLUMN_TITLES[0])
+                } else {
+                    let mut checked = all_checked;
+                    let response = ui.checkbox(&mut checked, "");
+                    if response.clicked() {
+                        toggle_all = true;
+                    }
+                    response
+                }
+            }
+            _ => ui.strong(TASK_COLUMN_TITLES[column]),
         });
+        if toggle_all {
+            if all_checked {
+                state.clear_checks();
+            } else {
+                state.select_all_tasks();
+            }
+        }
         ui.separator();
 
         if state.tasks.is_empty() {
@@ -601,70 +649,82 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
 
         for index in 0..state.tasks.len() {
             let task = state.tasks[index].clone();
-            let selected = state.is_task_selected(task.id);
+            let checked = state.is_task_selected(task.id);
             // 行内只记录交互结果，行外再改动状态，避免与界面查询互相借用。
-            let mut toggle_selection: Option<bool> = None;
+            let mut toggle = false;
             let mut double_clicked = false;
 
-            task_table_row(ui, &widths, index, selected, |ui, column| match column {
-                0 => {
-                    // 用带点击感应的 Label 而不是按钮：按钮文本会强制居中，撑满整列后短文件名会偏离左侧。
-                    let text = RichText::new(task.output_name.as_str());
-                    let text = if selected {
-                        text.strong().color(ui.visuals().selection.bg_fill)
-                    } else {
-                        text
-                    };
-                    let response = ui.add_sized(
-                        egui::vec2(widths[0], TASK_ROW_HEIGHT - 4.0),
-                        egui::Label::new(text)
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    );
-                    if response.clicked() {
-                        toggle_selection =
-                            Some(ui.input(|input| input.modifiers.ctrl || input.modifiers.shift));
-                    }
-                    if response.double_clicked() {
-                        double_clicked = true;
-                    }
-                    response.context_menu(|ui| {
-                        // 右键未选中的行时，只把这一行作为操作目标。
-                        if !state.is_task_selected(task.id) {
-                            state.selected_task_ids = vec![task.id];
+            let row_clicked = task_table_row(ui, &widths, index, checked, true, |ui, column| {
+                match column {
+                    0 => {
+                        let mut flag = checked;
+                        let response = ui.checkbox(&mut flag, "");
+                        if response.clicked() {
+                            toggle = true;
                         }
-                        context_menu(ui, state, &task);
-                    });
-                    response
+                        response
+                    }
+                    1 => {
+                        // 用带点击感应的 Label 而不是按钮：按钮文本会强制居中，
+                        // 撑满整列后短文件名会偏离左侧。
+                        let text = RichText::new(task.output_name.as_str());
+                        let text = if checked {
+                            text.strong().color(ui.visuals().selection.bg_fill)
+                        } else {
+                            text
+                        };
+                        let response = ui.add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        if response.clicked() {
+                            toggle = true;
+                        }
+                        if response.double_clicked() {
+                            double_clicked = true;
+                        }
+                        response.context_menu(|ui| {
+                            // 右键未勾选的行时，只把这一行作为操作目标。
+                            if !state.is_task_selected(task.id) {
+                                state.selected_task_ids = vec![task.id];
+                            }
+                            context_menu(ui, state, &task);
+                        });
+                        response
+                    }
+                    2 => status_label(ui, task.status),
+                    3 => ui.add(
+                        egui::ProgressBar::new(task.progress.clamp(0.0, 1.0))
+                            .show_percentage()
+                            .desired_height(12.0),
+                    ),
+                    _ => ui
+                        .add(egui::Label::new(task_detail(&task)).truncate())
+                        .on_hover_text(task.detail.as_str()),
                 }
-                1 => status_label(ui, task.status),
-                2 => ui.add_sized(
-                    [widths[2], 18.0],
-                    egui::ProgressBar::new(task.progress.clamp(0.0, 1.0)).show_percentage(),
-                ),
-                _ => ui
-                    .add_sized(
-                        [widths[3], TASK_ROW_HEIGHT - 4.0],
-                        egui::Label::new(task_detail(&task)).truncate(),
-                    )
-                    .on_hover_text(task.detail.as_str()),
             });
 
-            if let Some(additive) = toggle_selection {
-                state.select_task(task.id, additive);
+            if row_clicked {
+                toggle = true;
+            }
+            if toggle {
+                state.toggle_check(task.id);
             }
             if double_clicked {
                 match task.status {
                     TaskStatus::Waiting | TaskStatus::Failed | TaskStatus::Canceled => {
                         state.start_task(task.id)
                     }
-                    TaskStatus::Downloading | TaskStatus::Canceling => state.cancel_task(task.id),
+                    TaskStatus::Downloading | TaskStatus::Canceling => {
+                        state.reset_single_task(task.id)
+                    }
                     TaskStatus::Completed => state.open_task_directory(&task),
                 }
             }
         }
         ui.label(
-            RichText::new("提示：按住 Ctrl 或 Shift 点击可多选任务，双击可开始或取消")
+            RichText::new("提示：点击行或勾选框选择任务，双击可开始或取消，右键有更多操作")
                 .small()
                 .weak(),
         );
@@ -933,13 +993,23 @@ fn render_settings_window(ctx: &egui::Context, state: &mut AppState) {
                                     }
                                 }
                             });
-                            settings_row(ui, "当前状态", |ui| {
+                            // 状态与路径分两行：状态行给明确的检测结论，路径行放完整位置。
+                            settings_row(ui, "检测状态", |ui| {
                                 match &state.ffmpeg_status {
-                                    Some(path) => ui.label(RichText::new(path).weak()),
+                                    Some(_) => ui.label(
+                                        RichText::new("已检测到")
+                                            .color(Color32::from_rgb(55, 149, 82)),
+                                    ),
                                     None => ui.label(
                                         RichText::new("未检测到")
                                             .color(Color32::from_rgb(214, 166, 31)),
                                     ),
+                                };
+                            });
+                            settings_row(ui, "ffmpeg 路径", |ui| {
+                                match &state.ffmpeg_status {
+                                    Some(path) => ui.label(RichText::new(path).weak()),
+                                    None => ui.label(RichText::new("—").weak()),
                                 };
                             });
                         });
@@ -1115,6 +1185,30 @@ fn render_exit_confirmation(ctx: &egui::Context, state: &mut AppState) {
                 }
                 if ui.button("取消").clicked() {
                     state.show_exit_confirmation = false;
+                }
+            });
+        });
+}
+
+/// 清空任务列表前的二次确认弹窗。
+fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_clear_confirmation {
+        return;
+    }
+    egui::Window::new("清空任务列表")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("确定要清空任务列表吗？将移除所有已结束的任务。");
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if danger_button(ui, "清空").clicked() {
+                    state.clear_finished_tasks();
+                    state.show_clear_confirmation = false;
+                }
+                if ui.button("取消").clicked() {
+                    state.show_clear_confirmation = false;
                 }
             });
         });

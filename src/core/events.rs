@@ -73,6 +73,9 @@ pub struct NewTask {
     pub output_directory: PathBuf,
     pub max_workers: usize,
     pub request_headers: String,
+    /// 添加后是否立即开始下载。批量粘贴添加等需要人工确认的场景设为 false，
+    /// 任务保持「等待中」，由用户手动开始。
+    pub auto_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +83,13 @@ pub enum TaskCommand {
     Add(NewTask),
     Start(u64),
     StartAll,
-    Cancel(u64),
+    /// 重置任务：停止下载、删除已下载的分片、恢复为「等待中」。
+    /// 界面上的「取消」统一走这里，不产生「已取消」终态，也不保留断点续传。
+    Reset(Vec<u64>),
     Retry(u64),
     Delete(u64),
+    /// 移除所有已完成和已失败的任务（界面「删除」按钮，无视勾选）。
+    RemoveFinished,
     EditTask {
         id: u64,
         source_url: String,

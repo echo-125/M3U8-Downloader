@@ -139,9 +139,14 @@ async fn manager_loop(
             TaskCommand::Add(new_task) => add_task(&state, new_task),
             TaskCommand::Start(id) => start_task(&state, id),
             TaskCommand::StartAll => start_all_tasks(&state),
-            TaskCommand::Cancel(id) => cancel_task(&state, id),
+            TaskCommand::Reset(ids) => {
+                for id in ids {
+                    reset_task(&state, id);
+                }
+            }
             TaskCommand::Retry(id) => start_task(&state, id),
             TaskCommand::Delete(id) => delete_task(&state, id),
+            TaskCommand::RemoveFinished => remove_finished_tasks(&state),
             TaskCommand::EditTask {
                 id,
                 source_url,
@@ -248,7 +253,43 @@ fn add_task(state: &ManagerState, new_task: NewTask) {
         level: CoreLogLevel::Info,
         message: format!("任务已添加：{}", manifest.output_name),
     });
-    spawn_task(state, manifest, snapshot);
+    if new_task.auto_start {
+        spawn_task(state, manifest, snapshot);
+    } else {
+        register_idle_task(state, manifest, snapshot);
+    }
+}
+
+/// 把任务登记进任务表但不启动下载，保持「等待中」状态，等用户手动开始。
+fn register_idle_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSnapshot) {
+    let id = manifest.id;
+    snapshot.status = TaskStatus::Waiting;
+    snapshot.detail = "等待下载槽位".to_string();
+    let _ = state
+        .event_sender
+        .send(TaskEvent::Snapshot(snapshot.clone()));
+    let run_id = state.next_run_id.fetch_add(1, Ordering::Relaxed);
+    let cancellation_token = CancellationToken::new();
+    let tasks = state.tasks.clone();
+    let event_sender = state.event_sender.clone();
+    let run_token = cancellation_token.clone();
+    // 占位协程只响应取消：不开始下载。任务真正开始时会由 start_task 重建并替换句柄。
+    let handle = tokio::spawn(async move {
+        run_token.cancelled().await;
+        finish_task(&tasks, id, run_id, Err(CoreError::Canceled), &event_sender);
+    });
+    if let Ok(mut tasks) = state.tasks.lock() {
+        tasks.insert(
+            id,
+            TaskRuntime {
+                manifest,
+                snapshot,
+                run_id,
+                cancellation_token,
+                handle,
+            },
+        );
+    }
 }
 
 fn spawn_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSnapshot) {
@@ -454,20 +495,95 @@ fn start_all_tasks(state: &ManagerState) {
     }
 }
 
-fn cancel_task(state: &ManagerState, id: u64) {
-    if let Ok(mut tasks) = state.tasks.lock() {
+/// 重置任务：停止下载、删除已下载的分片、恢复「等待中」，不保留断点续传。
+/// 已完成的任务不参与重置（成品不该被删）。
+fn reset_task(state: &ManagerState, id: u64) {
+    let pending = {
+        let Ok(mut tasks) = state.tasks.lock() else {
+            return;
+        };
         let Some(runtime) = tasks.get_mut(&id) else {
             return;
         };
-        if runtime.snapshot.status.is_active() {
-            runtime.cancellation_token.cancel();
-            runtime.snapshot.status = TaskStatus::Canceling;
-            runtime.snapshot.detail = "正在取消任务".to_string();
-            let snapshot = runtime.snapshot.clone();
-            drop(tasks);
-            let _ = state.event_sender.send(TaskEvent::Snapshot(snapshot));
+        if !matches!(
+            runtime.snapshot.status,
+            TaskStatus::Waiting
+                | TaskStatus::Downloading
+                | TaskStatus::Canceling
+                | TaskStatus::Failed
+        ) {
+            // 已完成的任务不重置。
+            return;
+        }
+        runtime.cancellation_token.cancel();
+        runtime.handle.abort();
+        // 删除已下载的分片，重置后从头下载。
+        if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
+            let _ = state.event_sender.send(TaskEvent::Log {
+                level: CoreLogLevel::Warning,
+                message: format!("重置任务清理分片失败：{}", error.user_message()),
+            });
+        }
+        runtime.manifest.completed = false;
+        runtime.manifest.output_path = None;
+        if let Err(error) = runtime.manifest.save() {
+            let _ = state.event_sender.send(TaskEvent::Log {
+                level: CoreLogLevel::Warning,
+                message: format!("重置任务保存失败：{}", error.user_message()),
+            });
+        }
+        Some((runtime.manifest.clone(), runtime.snapshot.clone()))
+    };
+    let Some((manifest, snapshot)) = pending else {
+        return;
+    };
+    register_idle_task(state, manifest, snapshot);
+}
+
+/// 移除所有已完成和已失败的任务（界面「删除」按钮，无视勾选）。
+fn remove_finished_tasks(state: &ManagerState) {
+    let removed: Vec<TaskRuntime> = {
+        let Ok(mut tasks) = state.tasks.lock() else {
+            return;
+        };
+        let finished: Vec<u64> = tasks
+            .values()
+            .filter(|runtime| {
+                matches!(
+                    runtime.snapshot.status,
+                    TaskStatus::Completed | TaskStatus::Failed
+                )
+            })
+            .map(|runtime| runtime.manifest.id)
+            .collect();
+        finished.iter().filter_map(|id| tasks.remove(id)).collect()
+    };
+    if removed.is_empty() {
+        return;
+    }
+    for runtime in &removed {
+        runtime.cancellation_token.cancel();
+        runtime.handle.abort();
+        // 未完成的（失败）任务要打标记，避免重启后作为断点续传重新载入。
+        if !runtime.manifest.completed {
+            let mut manifest = runtime.manifest.clone();
+            if let Err(error) = manifest.mark_dismissed() {
+                let _ = state.event_sender.send(TaskEvent::Log {
+                    level: CoreLogLevel::Warning,
+                    message: format!("标记已删除任务失败：{}", error.user_message()),
+                });
+            }
+        }
+        // 清理临时分片目录。
+        if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
+            let _ = state.event_sender.send(TaskEvent::Log {
+                level: CoreLogLevel::Warning,
+                message: format!("清理任务临时文件失败：{}", error.user_message()),
+            });
         }
     }
+    let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
+    let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
 }
 
 fn delete_task(state: &ManagerState, id: u64) {
