@@ -1,6 +1,9 @@
 # Rust 构建产物
 /target/
 
+# 打包产物（build_exe.ps1 生成）
+/dist/
+
 # 便携模式运行时生成在程序目录的文件
 /config.json
 /tasks.json

@@ -1,3 +1,6 @@
+// 发布版不挂控制台，避免启动时弹出黑色窗口；debug 构建保留以便看运行日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod config;
 mod core;
