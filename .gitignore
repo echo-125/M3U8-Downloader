@@ -1,0 +1,15 @@
+# Rust 构建产物
+/target/
+
+# 便携模式运行时生成在程序目录的文件
+/config.json
+/tasks.json
+/logs/
+
+# 任务临时分片目录
+.cat-catch-tasks/
+
+# 系统与编辑器杂物
+Thumbs.db
+desktop.ini
+.DS_Store
