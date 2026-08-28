@@ -104,6 +104,27 @@ fn primary_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Respons
     ui.add_enabled(enabled, button)
 }
 
+/// 描边样式的次要按钮。与填充的主按钮并排时形成主次层级，
+/// 避免一行里出现两个同样抢眼的实心按钮。
+fn outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let accent = ui.visuals().selection.bg_fill;
+    let response = ui.add(
+        egui::Button::new(RichText::new(text).color(accent))
+            .fill(Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0_f32, accent)),
+    );
+    // 显式设置 fill 会盖掉 Button 内置的悬停反馈（它靠 weak_bg_fill 变化），
+    // 这里补一道更粗的描边作为悬停提示，即时模式下下一帧生效。
+    if response.hovered() {
+        ui.painter().rect_stroke(
+            response.rect,
+            ui.visuals().widgets.hovered.rounding,
+            egui::Stroke::new(2.0_f32, accent),
+        );
+    }
+    response
+}
+
 /// 危险操作按钮：红色填充，用于退出确认等需要强调后果的操作。
 fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
@@ -365,6 +386,10 @@ fn render_single_task_form(ui: &mut egui::Ui, state: &mut AppState) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if primary_button(ui, true, "添加任务").clicked() {
                 state.add_single_task();
+            }
+            // 直接读剪贴板批量添加，省掉先粘贴到输入框再点添加这一步。
+            if outline_button(ui, "粘贴添加").clicked() {
+                state.paste_and_add_tasks();
             }
         });
     });

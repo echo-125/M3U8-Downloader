@@ -301,47 +301,97 @@ impl AppState {
     }
 
     pub fn add_batch_tasks(&mut self) {
+        let text = self.batch_text.clone();
         let output_directory = self.output_directory(&self.batch_path);
-        let mut valid = 0;
-        let mut invalid = 0;
-        for line in self.batch_text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split('|').map(str::trim).collect();
-            if parts.is_empty() || !is_valid_http_url(parts[0]) {
-                invalid += 1;
-                continue;
-            }
-            let source_url = parts[0].to_string();
-            let output_name = if parts.len() >= 2 && !parts[1].is_empty() {
-                sanitize_filename(parts[1])
-            } else {
-                derive_output_name(&source_url)
-            };
-            let request_headers = if parts.len() >= 3 {
-                parts[2].to_string()
-            } else {
-                String::new()
-            };
-            self.manager.send(TaskCommand::Add(NewTask {
-                source_url,
-                output_name,
-                output_directory: output_directory.clone(),
-                max_workers: self.settings.max_workers,
-                request_headers,
-            }));
-            valid += 1;
-        }
+        let max_workers = self.settings.max_workers;
+        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers);
         if valid > 0 {
             self.logs
                 .push_info(format!("批量添加完成：成功 {valid} 个"));
             self.batch_text.clear();
         }
-        if invalid > 0 {
-            self.notify_error(format!("批量添加有 {invalid} 行无效，已跳过"));
+        self.report_invalid_lines(&errors);
+    }
+
+    /// 从剪贴板读取多行内容并直接添加，跳过手动粘贴到输入框的步骤。
+    ///
+    /// 失败提示一律只弹提示不写日志：剪贴板里的内容是用户输入，
+    /// 格式不合预期属于输入问题，不该占用记录运行异常的日志。
+    pub fn paste_and_add_tasks(&mut self) {
+        let Some(text) = clipboard_text() else {
+            self.show_toast("粘贴添加失败：无法读取剪贴板", true);
+            return;
+        };
+        if text.trim().is_empty() {
+            self.show_toast("粘贴添加失败：剪贴板为空", true);
+            return;
         }
+        // 按钮在单个任务页，因此沿用该页的保存路径与线程数。
+        let output_directory = self.output_directory(&self.single_path);
+        let max_workers = self.single_workers.clamp(1, 64);
+        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers);
+        if valid == 0 {
+            self.show_toast(
+                "粘贴添加失败：剪贴板中没有符合格式的内容\n格式为 链接|文件名 或 链接|文件名|请求头JSON",
+                true,
+            );
+            self.report_invalid_lines(&errors);
+            return;
+        }
+        self.logs
+            .push_info(format!("粘贴添加完成：成功 {valid} 个"));
+        self.report_invalid_lines(&errors);
+    }
+
+    /// 逐行解析 `链接|文件名|请求头JSON` 并下发添加命令。
+    /// 返回成功数与逐行的失败原因（已带行号），便于提示用户哪一行格式不对。
+    fn add_tasks_from_text(
+        &mut self,
+        text: &str,
+        output_directory: PathBuf,
+        max_workers: usize,
+    ) -> (usize, Vec<String>) {
+        let mut valid = 0;
+        let mut errors = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (source_url, output_name, request_headers) = match parse_task_line(line) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    errors.push(format!("第 {} 行：{reason}", index + 1));
+                    continue;
+                }
+            };
+            // 没有写出文件名时按链接推导，保证任务名不为空。
+            let output_name = output_name.unwrap_or_else(|| derive_output_name(&source_url));
+            self.manager.send(TaskCommand::Add(NewTask {
+                source_url,
+                output_name,
+                output_directory: output_directory.clone(),
+                max_workers,
+                request_headers,
+            }));
+            valid += 1;
+        }
+        (valid, errors)
+    }
+
+    /// 无效行只在界面提示，不写日志：这是粘贴内容的格式问题，不是程序运行异常，
+    /// 记进日志会淹没真正的下载错误。
+    fn report_invalid_lines(&mut self, errors: &[String]) {
+        if errors.is_empty() {
+            return;
+        }
+        let mut message = format!("有 {} 行格式不正确，已跳过", errors.len());
+        let shown = errors.len().min(3);
+        message.push_str(&format!("：\n{}", errors[..shown].join("\n")));
+        if errors.len() > shown {
+            message.push_str(&format!("\n……另有 {} 行未显示", errors.len() - shown));
+        }
+        self.show_toast(message, true);
     }
 
     pub fn scan_manual_folder(&mut self) {
@@ -499,31 +549,28 @@ impl AppState {
     /// 从剪贴板粘贴任务信息，支持 `链接|文件名|请求头JSON` 的增强格式。
     pub fn paste_from_clipboard(&mut self) {
         let Some(text) = clipboard_text() else {
-            self.notify_error("粘贴失败：无法读取剪贴板");
+            self.show_toast("粘贴失败：无法读取剪贴板", true);
             return;
         };
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            self.notify_error("粘贴失败：剪贴板为空");
+            self.show_toast("粘贴失败：剪贴板为空", true);
             return;
         }
-        let parts: Vec<&str> = trimmed.split('|').collect();
-        let url = parts[0].trim();
-        if !is_valid_http_url(url) {
-            self.logs
-                .push_error("粘贴失败：剪贴板内容不是有效的 M3U8 链接");
-            return;
-        }
-        self.single_url = url.to_string();
-        if let Some(name) = parts.get(1).map(|value| value.trim()) {
-            if !name.is_empty() {
-                self.single_name = (*name).to_string();
+        let (source_url, output_name, request_headers) = match parse_task_line(trimmed) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                self.show_toast(format!("粘贴失败：{reason}"), true);
+                return;
             }
+        };
+        self.single_url = source_url;
+        // 只有剪贴板显式带出的字段才覆盖，自动推导的名字不覆盖用户已填内容。
+        if let Some(name) = output_name {
+            self.single_name = name;
         }
-        if let Some(headers) = parts.get(2).map(|value| value.trim()) {
-            if !headers.is_empty() {
-                self.single_headers = (*headers).to_string();
-            }
+        if !request_headers.is_empty() {
+            self.single_headers = request_headers;
         }
         self.logs.push_info("已从剪贴板粘贴链接");
     }
@@ -610,6 +657,51 @@ impl AppState {
     }
 }
 
+/// 校验请求头文本是合法的 JSON 对象。
+///
+/// 格式错误时必须拦下：请求头被静默忽略的话下载会失败，而用户很难想到是粘贴内容的问题。
+/// 空文本视为未填写请求头，允许通过。
+fn validate_header_json(text: &str) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("请求头 JSON 格式错误：{error}"))?;
+    if !value.is_object() {
+        return Err(r#"请求头必须是 JSON 对象，例如 {"Referer":"https://example.com"}"#.into());
+    }
+    Ok(())
+}
+
+/// 解析 `链接|文件名|请求头JSON`，格式不合法时返回具体原因。
+///
+/// 只按前两个竖线切分：请求头取剩余的全部内容，这样 JSON 内部的 `|` 不会被切断。
+/// 链接自身若含 `|` 会被当成分隔符，这是竖线分隔格式的固有歧义，无法可靠区分。
+/// 返回（链接，显式给出的文件名，请求头）。文件名未写出时为 None。
+fn parse_task_line(line: &str) -> Result<(String, Option<String>, String), String> {
+    let mut parts = line.splitn(3, '|').map(str::trim);
+    let source_url = parts.next().unwrap_or_default();
+    if source_url.is_empty() {
+        return Err("链接为空".into());
+    }
+    if !is_valid_http_url(source_url) {
+        return Err("链接不是有效的 HTTP 或 HTTPS 地址".into());
+    }
+    let output_name = parts
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(sanitize_filename);
+    let request_headers = match parts.next() {
+        Some(headers) => {
+            validate_header_json(headers)?;
+            headers.to_string()
+        }
+        None => String::new(),
+    };
+    Ok((source_url.to_string(), output_name, request_headers))
+}
+
 pub fn is_valid_http_url(value: &str) -> bool {
     Url::parse(value)
         .map(|url| matches!(url.scheme(), "http" | "https"))
@@ -651,5 +743,63 @@ mod tests {
             derive_output_name("https://example.com/video/a:b.m3u8"),
             "a_b"
         );
+    }
+
+    #[test]
+    fn parses_task_line_in_all_forms() {
+        let (url, name, headers) =
+            parse_task_line(r#"https://a.com/v.m3u8|我的视频|{"Referer":"x"}"#).unwrap();
+        assert_eq!(url, "https://a.com/v.m3u8");
+        assert_eq!(name.as_deref(), Some("我的视频"));
+        assert_eq!(headers, r#"{"Referer":"x"}"#);
+
+        // 省略文件名时返回 None，由调用方决定是否自动推导
+        let (_, name, headers) = parse_task_line("https://a.com/path/video.m3u8").unwrap();
+        assert_eq!(name, None);
+        assert_eq!(headers, "");
+
+        // 文件名是空白时同样视为未给出
+        let (_, name, _) = parse_task_line("https://a.com/path/video.m3u8|   ").unwrap();
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn accepts_empty_request_headers() {
+        // 显式留空的请求头视为未填写，不应报错
+        let (_, _, headers) = parse_task_line("https://a.com/v.m3u8|视频|").unwrap();
+        assert_eq!(headers, "");
+    }
+
+    #[test]
+    fn rejects_bad_request_headers() {
+        // 非法的 JSON 必须拦下，否则请求头会被静默忽略导致下载失败
+        assert!(parse_task_line(r#"https://a.com/v.m3u8|视频|{"Referer":}"#).is_err());
+        // 常见的 Python 字典字面量不是合法 JSON
+        assert!(parse_task_line("https://a.com/v.m3u8|视频|{'Referer':'x'}").is_err());
+        // 必须是对象而不是数组或标量
+        assert!(parse_task_line(r#"https://a.com/v.m3u8|视频|["a"]"#).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_links() {
+        assert!(parse_task_line("not-a-url").is_err());
+        assert!(parse_task_line("").is_err());
+        assert!(parse_task_line("ftp://a.com/v.m3u8").is_err());
+    }
+
+    #[test]
+    fn keeps_pipe_inside_request_headers() {
+        // 请求头取剩余全部内容，JSON 内部的竖线不会被当成字段分隔符切断
+        let (_, name, headers) =
+            parse_task_line(r#"https://a.com/v.m3u8|视频|{"UA":"a|b"}"#).unwrap();
+        assert_eq!(name.as_deref(), Some("视频"));
+        assert_eq!(headers, r#"{"UA":"a|b"}"#);
+    }
+
+    #[test]
+    fn rejects_extra_fields_instead_of_ignoring_them() {
+        // 超过三段的竖线会并入请求头导致 JSON 非法，
+        // 必须报错而不是静默丢弃多余字段
+        assert!(parse_task_line(r#"https://a.com/v.m3u8|视频|{"UA":"x"}|多余"#).is_err());
     }
 }
