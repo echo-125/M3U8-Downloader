@@ -705,6 +705,7 @@ dependencies = [
  "dirs 5.0.1",
  "eframe",
  "encoding_rs",
+ "flate2",
  "futures-util",
  "image",
  "reqwest",

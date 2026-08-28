@@ -1,3 +1,39 @@
+use std::borrow::Cow;
+use std::io::Read;
+
+use flate2::read::GzDecoder;
+
+/// gzip 文件的固定两字节标识。
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+/// 解压后允许的最大字节数。错误响应通常很小，设上限是为了避免异常压缩数据撑爆内存。
+const MAX_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 按 gzip 标识尝试解压，失败或不是 gzip 时原样返回。
+///
+/// reqwest 只在响应带 `Content-Encoding: gzip` 时自动解压，部分 CDN 会返回
+/// gzip 数据却不声明该头部（错误响应尤其常见），这里按标识兜底解压，
+/// 否则后续格式诊断只会看到一串乱码，报不出真实原因。
+fn try_decompress_gzip(data: &[u8]) -> Cow<'_, [u8]> {
+    if data.len() < GZIP_MAGIC.len() || data[..2] != GZIP_MAGIC {
+        return Cow::Borrowed(data);
+    }
+    match decompress_gzip(data) {
+        Ok(decoded) => Cow::Owned(decoded),
+        Err(_) => Cow::Borrowed(data),
+    }
+}
+
+fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    // 多读一个字节用于判断是否超限，take 本身只截断不报错。
+    let mut decoder = GzDecoder::new(data).take(MAX_DECOMPRESSED_BYTES + 1);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+    if decoded.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::other("解压后的数据过大"));
+    }
+    Ok(decoded)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentFormat {
     Ts,
@@ -26,7 +62,13 @@ impl SegmentFormat {
 const ERROR_TEXT_KEYS: &[&str] = &["message", "msg", "error", "detail", "reason", "info"];
 const ERROR_CODE_KEYS: &[&str] = &["code", "status", "errcode", "errno"];
 
+/// 检测分片内容的实际格式，必要时先解压 gzip。
 pub fn detect_format(data: &[u8]) -> SegmentFormat {
+    detect_format_decoded(&try_decompress_gzip(data))
+}
+
+/// 对已经解压过的内容做格式检测。
+fn detect_format_decoded(data: &[u8]) -> SegmentFormat {
     if data.first() == Some(&0x47) {
         return SegmentFormat::Ts;
     }
@@ -69,8 +111,10 @@ pub fn is_error_response(data: &[u8]) -> bool {
 }
 
 pub fn diagnostic_message(data: &[u8]) -> String {
-    let format = detect_format(data);
-    if let Some(detail) = error_detail(data) {
+    let data = try_decompress_gzip(data);
+    let data: &[u8] = &data;
+    let format = detect_format_decoded(data);
+    if let Some(detail) = error_detail_decoded(data) {
         return format!("服务器返回{}：{detail}", format.label());
     }
     match format {
@@ -88,7 +132,12 @@ pub fn diagnostic_message(data: &[u8]) -> String {
 
 /// 从 JSON 或 HTML 错误响应里提取人类可读的原因，提取不到时返回 None。
 pub fn error_detail(data: &[u8]) -> Option<String> {
-    match detect_format(data) {
+    error_detail_decoded(&try_decompress_gzip(data))
+}
+
+/// 对已经解压过的内容提取错误原因。
+fn error_detail_decoded(data: &[u8]) -> Option<String> {
+    match detect_format_decoded(data) {
         SegmentFormat::Html => html_error_detail(data),
         SegmentFormat::Json => json_error_detail(data),
         _ => None,
@@ -195,6 +244,39 @@ mod tests {
     fn extracts_html_error_detail() {
         let body = b"<!DOCTYPE html><html><head><title>403 Forbidden</title></head></html>";
         assert_eq!(error_detail(body).as_deref(), Some("403 Forbidden"));
+    }
+
+    #[test]
+    fn decompresses_gzipped_error_response() {
+        // CDN 返回 gzip 压缩的错误响应却不声明 Content-Encoding 时，
+        // 不解压的话格式检测只会看到乱码，报不出真实原因。
+        let body = r#"{"code":40301,"message":"签名已过期"}"#.as_bytes();
+        let gzipped = gzip_compress(body);
+        assert_ne!(&gzipped[..2], &body[..2]);
+        assert_eq!(detect_format(&gzipped), SegmentFormat::Json);
+        assert_eq!(
+            error_detail(&gzipped).as_deref(),
+            Some("错误码 40301，签名已过期")
+        );
+        assert!(is_error_response(&gzipped));
+    }
+
+    #[test]
+    fn leaves_non_gzip_data_untouched() {
+        let ts_packet = vec![0x47; 376];
+        assert_eq!(detect_format(&ts_packet), SegmentFormat::Ts);
+        // 截断的 gzip 数据解压失败，应原样返回而不是报错。
+        let broken = vec![0x1f, 0x8b, 0x08, 0x00];
+        assert_eq!(detect_format(&broken), SegmentFormat::Unknown);
+    }
+
+    /// 用 flate2 生成 gzip 数据，仅测试使用。
+    fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
     }
 
     #[test]
