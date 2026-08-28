@@ -77,6 +77,66 @@ pub async fn remux_to_mp4(
     )))
 }
 
+/// 用 concat 协议合并自带 ftyp/moov 的分片。
+///
+/// 部分 fMP4 流没有独立的初始化段，分片各自携带 ftyp/moov，直接二进制拼接会
+/// 重复出现多次初始化信息而无法播放，必须交给 ffmpeg 按 concat 协议重新组装。
+pub async fn concat_copy_to_mp4(
+    program: &str,
+    concat_list: &Path,
+    output: &Path,
+) -> Result<PathBuf, FfmpegError> {
+    if output.exists() {
+        return Err(FfmpegError::Execution("输出文件已存在".into()));
+    }
+    let arguments = concat_arguments(concat_list, output);
+    let output_result = run_command(program, &arguments, Some(FFMPEG_TIMEOUT)).await?;
+    if output_result.status.success() && output.is_file() {
+        return Ok(output.to_path_buf());
+    }
+    let _ = tokio::fs::remove_file(output).await;
+    Err(FfmpegError::Conversion(last_error_lines(
+        &output_result.stderr,
+    )))
+}
+
+fn concat_arguments(concat_list: &Path, output: &Path) -> Vec<String> {
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-f".to_string(),
+        "concat".to_string(),
+        // 允许列表里出现绝对路径，否则 ffmpeg 会拒绝读取。
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        concat_list.to_string_lossy().into_owned(),
+        "-c".to_string(),
+        "copy".to_string(),
+        "-y".to_string(),
+        output.to_string_lossy().into_owned(),
+    ]
+}
+
+/// 生成 ffmpeg concat 列表文件。
+///
+/// concat 语法中单引号内的反斜杠是转义字符，Windows 路径要统一换成正斜杠，
+/// 路径里的单引号用 `\' ` 转义，否则会提前闭合导致 ffmpeg 解析失败。
+pub fn write_concat_list(paths: &[PathBuf], list_path: &Path) -> Result<(), std::io::Error> {
+    let mut content = String::new();
+    for path in paths {
+        let escaped = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "\\'");
+        content.push_str("file '");
+        content.push_str(&escaped);
+        content.push_str("'\n");
+    }
+    std::fs::write(list_path, content)
+}
+
 fn copy_arguments(input: &Path, output: &Path, faststart: bool) -> Vec<String> {
     build_arguments(input, output, &["-c", "copy"], faststart)
 }
@@ -155,4 +215,28 @@ fn last_error_lines(stderr: &[u8]) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_windows_paths_in_concat_list() {
+        // concat 语法里单引号内的反斜杠是转义字符，Windows 路径必须换成正斜杠，
+        // 路径里的单引号要转义，否则 ffmpeg 会提前闭合字符串导致解析失败。
+        let paths = vec![
+            PathBuf::from(r"C:\temp\segment 1.m4s"),
+            PathBuf::from(r"C:\temp\it's.m4s"),
+        ];
+        let list_path =
+            std::env::temp_dir().join(format!("cat-catch-concat-{}.txt", std::process::id()));
+        write_concat_list(&paths, &list_path).unwrap();
+        let content = std::fs::read_to_string(&list_path).unwrap();
+        let _ = std::fs::remove_file(&list_path);
+        assert_eq!(
+            content,
+            "file 'C:/temp/segment 1.m4s'\nfile 'C:/temp/it\\'s.m4s'\n"
+        );
+    }
 }

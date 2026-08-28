@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::core::{
@@ -99,9 +100,17 @@ pub async fn merge_segments(
             }
         }
         SegmentFormat::Fmp4 => {
-            let initialization = initialization
-                .filter(|path| path.is_file())
-                .ok_or_else(|| CoreError::InvalidSegment("fMP4 分片缺少初始化段".into()))?;
+            let Some(initialization) = initialization.filter(|path| path.is_file()) else {
+                // 没有独立初始化段时分片自身携带 ftyp/moov，二进制拼接会重复初始化信息，
+                // 只能交给 ffmpeg 按 concat 协议重新组装。
+                return concat_fmp4_segments(
+                    segment_paths,
+                    output_directory,
+                    output_name,
+                    ffmpeg_program,
+                )
+                .await;
+            };
             let output = unique_output_path(output_directory, output_name, "mp4");
             let raw_output = output.with_extension("raw.mp4");
             concatenate(
@@ -138,6 +147,52 @@ pub async fn merge_segments(
             format.label()
         ))),
     }
+}
+
+/// fMP4 分片缺少独立初始化段时的合并路径：交给 ffmpeg 的 concat 协议组装。
+async fn concat_fmp4_segments(
+    segment_paths: &[PathBuf],
+    output_directory: &Path,
+    output_name: &str,
+    ffmpeg_program: Option<&str>,
+) -> Result<MergeResult, CoreError> {
+    let Some(program) = ffmpeg_program else {
+        return Err(CoreError::InvalidInput(
+            "fMP4 分片缺少初始化段，需要 ffmpeg 才能按 concat 协议合并".into(),
+        ));
+    };
+    let output = unique_output_path(output_directory, output_name, "mp4");
+    // 列表只是中间产物，用时间戳命名而不是 unique_output_path：
+    // 后者「先检查再使用」不是原子的，同名任务并发合并时会拿到同一个路径，
+    // 先完成的一方删掉列表会让另一方直接失败。
+    let concat_list = temporary_concat_list_path(output_directory, output_name);
+    let paths = segment_paths.to_vec();
+    let list_path = concat_list.clone();
+    tokio::task::spawn_blocking(move || crate::ffmpeg::write_concat_list(&paths, &list_path))
+        .await
+        .map_err(|_| CoreError::Io("写入 concat 列表失败".into()))?
+        .map_err(|_| CoreError::Io("写入 concat 列表失败".into()))?;
+
+    let result = crate::ffmpeg::concat_copy_to_mp4(program, &concat_list, &output).await;
+    // 列表是中间产物，无论成败都要清理。
+    let _ = tokio::fs::remove_file(&concat_list).await;
+    match result {
+        Ok(_) => Ok(MergeResult {
+            output_path: output,
+            used_ffmpeg: true,
+            message: "fMP4 分片已通过 concat 协议合并".into(),
+        }),
+        Err(error) => Err(CoreError::Ffmpeg(error.to_string())),
+    }
+}
+
+/// concat 列表文件的路径，用纳秒时间戳保证同名任务并发合并时不会撞名。
+fn temporary_concat_list_path(directory: &Path, name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    directory.join(format!("{}.concat.{nanos}.txt", sanitize_filename(name)))
 }
 
 pub async fn scan_merge_folder(folder: &Path) -> Result<MergeScanResult, CoreError> {
