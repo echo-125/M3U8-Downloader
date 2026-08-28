@@ -51,10 +51,19 @@ impl Palette {
     }
 }
 
+/// 按钮上只写目标主题，名称保持简短。
 pub fn switch_label(theme: ThemeKind) -> &'static str {
     match theme {
-        ThemeKind::Light => "切换到暗色",
-        ThemeKind::Dark => "切换到亮色",
+        ThemeKind::Light => "暗色",
+        ThemeKind::Dark => "亮色",
+    }
+}
+
+/// 悬停时补足完整说明，避免只看到「暗色」两个字不清楚是切换还是当前状态。
+pub fn switch_hint(theme: ThemeKind) -> &'static str {
+    match theme {
+        ThemeKind::Light => "切换到暗色主题",
+        ThemeKind::Dark => "切换到亮色主题",
     }
 }
 

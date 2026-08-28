@@ -5,7 +5,7 @@ use eframe::egui::{
 
 use super::{
     state::{AppState, CreationTab, EditTask},
-    theme::switch_label,
+    theme::{switch_hint, switch_label},
 };
 use crate::config::ProxyScheme;
 use crate::core::events::{TaskSnapshot, TaskStatus};
@@ -270,8 +270,12 @@ fn render_title_bar(ctx: &egui::Context, state: &mut AppState) {
                     if ui.button("设置").clicked() {
                         state.settings_open = true;
                     }
-                    let label = switch_label(state.settings.appearance.theme);
-                    if ui.button(label).clicked() {
+                    let theme = state.settings.appearance.theme;
+                    // 只写目标主题名，完整说明放在悬停提示里。
+                    if outline_button(ui, switch_label(theme))
+                        .on_hover_text(switch_hint(theme))
+                        .clicked()
+                    {
                         state.toggle_theme();
                     }
                 });
