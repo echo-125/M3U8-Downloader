@@ -169,6 +169,17 @@ impl AppState {
                         CoreLogLevel::Warning => LogLevel::Warning,
                         CoreLogLevel::Error => LogLevel::Error,
                     };
+                    // 单向桥接到文件日志：核心只走事件通道，若这里不转写，
+                    // 任务失败原因、合并结果这类信息就只留在界面日志里，文件日志查不到。
+                    //
+                    // 注意 tracing 的 writer 内部持有 LogFile 的互斥锁且不可重入，
+                    // 因此 process_events 以及它调用的 logs 写入路径，
+                    // 都不得再触发任何 tracing 调用，否则会自己锁死自己。
+                    match level {
+                        LogLevel::Info => tracing::info!("{message}"),
+                        LogLevel::Warning => tracing::warn!("{message}"),
+                        LogLevel::Error => tracing::error!("{message}"),
+                    }
                     self.logs.push(level, message);
                 }
                 TaskEvent::Toast { message, error } => {

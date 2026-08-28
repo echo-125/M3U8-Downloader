@@ -148,14 +148,17 @@ async fn manager_loop(
                 output_name,
                 output_directory,
                 request_headers,
-            } => edit_task(
-                &state,
-                id,
-                source_url,
-                output_name,
-                output_directory,
-                request_headers,
-            ),
+            } => {
+                edit_task(
+                    &state,
+                    id,
+                    source_url,
+                    output_name,
+                    output_directory,
+                    request_headers,
+                )
+                .await
+            }
             TaskCommand::ClearFinished => clear_finished_tasks(&state),
             TaskCommand::ResumeTasks(directories) => resume_tasks(&state, directories),
             TaskCommand::UpdateSettings(new_settings) => update_settings(&state, new_settings),
@@ -498,7 +501,7 @@ fn delete_task(state: &ManagerState, id: u64) {
         .send(TaskEvent::TasksRemoved { ids: vec![id] });
 }
 
-fn edit_task(
+async fn edit_task(
     state: &ManagerState,
     id: u64,
     source_url: String,
@@ -535,7 +538,17 @@ fn edit_task(
     }
     let output_directory = PathBuf::from(output_directory.trim());
 
-    if let Ok(mut tasks) = state.tasks.lock() {
+    // 先在锁内取出待写回的 manifest，并判断是否需要迁移分片目录。
+    //
+    // 迁移前主动释放锁是有意为之：下面的复制是同步 IO，持锁执行会长时间占住任务表。
+    // 代价是迁移期间任务可能被删除或再次编辑：
+    // - 被删除：由下方 TaskGone 分支清理迁移出的目录；
+    // - 再次编辑：不会发生。编辑窗口是模态的，迁移完成前 GUI 不会投递第二个 EditTask。
+    //   若将来新增并发投递路径（热键、拖拽等），需要先在这里占一个按任务 id 的编辑令牌。
+    let (updated, migration) = {
+        let Ok(mut tasks) = state.tasks.lock() else {
+            return;
+        };
         let Some(runtime) = tasks.get_mut(&id) else {
             return;
         };
@@ -555,8 +568,21 @@ fn edit_task(
         // 输出名或保存目录变化后任务目录随之变化，必须迁移已下载的分片。
         let previous_directory = runtime.manifest.task_directory();
         let current_directory = updated.task_directory();
-        if previous_directory != current_directory && previous_directory.is_dir() {
-            if let Err(error) = move_task_directory(&previous_directory, &current_directory) {
+        let migration = (previous_directory != current_directory && previous_directory.is_dir())
+            .then_some((previous_directory, current_directory));
+        (updated, migration)
+    };
+
+    // 迁移完成后要判空撤销，这里先留下目标目录的副本。
+    let target_directory = migration.as_ref().map(|(_, to)| to.clone());
+
+    // 迁移是同步 IO，要复制的分片可能有几个 GB。必须放到阻塞线程池并释放任务锁，
+    // 否则会占满 tokio worker 让其他下载任务跟着一起卡住。
+    if let Some((from, to)) = migration {
+        let result = tokio::task::spawn_blocking(move || move_task_directory(&from, &to)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
                 send_log_and_toast(
                     &state.event_sender,
                     CoreLogLevel::Error,
@@ -564,32 +590,79 @@ fn edit_task(
                 );
                 return;
             }
+            Err(_) => {
+                send_log_and_toast(
+                    &state.event_sender,
+                    CoreLogLevel::Error,
+                    "编辑失败：迁移分片任务被中断".to_string(),
+                );
+                return;
+            }
         }
-        runtime.manifest = updated;
-        if let Err(error) = runtime.manifest.save() {
-            send_log_and_toast(
-                &state.event_sender,
-                CoreLogLevel::Error,
-                format!("编辑失败：{}", error.user_message()),
-            );
-            return;
-        }
-        runtime.snapshot.source_url = runtime.manifest.source_url.clone();
-        runtime.snapshot.output_name = runtime.manifest.output_name.clone();
-        runtime.snapshot.output_directory = runtime
-            .manifest
-            .output_directory
-            .to_string_lossy()
-            .into_owned();
-        runtime.snapshot.request_headers = runtime.manifest.request_headers_json();
-        let snapshot = runtime.snapshot.clone();
-        drop(tasks);
-        let _ = state.event_sender.send(TaskEvent::Snapshot(snapshot));
-        let _ = state.event_sender.send(TaskEvent::Log {
-            level: CoreLogLevel::Info,
-            message: "任务已更新".to_string(),
-        });
     }
+
+    // 只有任务在迁移期间被删除才需要清理新目录。删除任务走的是 delete_task，
+    // 它清的是 manifest 里记录的旧目录，两条路径不重叠，新目录只能由这里回收。
+    // 保存失败时分片已迁到新目录，绝不能撤销，否则会连分片一起删掉。
+    if matches!(
+        apply_edited_manifest(state, id, updated),
+        EditOutcome::TaskGone
+    ) {
+        // 复制出去的目录成了孤儿，清理掉并提示用户。
+        if let Some(to) = target_directory {
+            let message = match safe_remove_directory(&to) {
+                Ok(()) => "任务已不存在，迁移的分片目录已撤销".to_string(),
+                Err(error) => format!("任务已不存在，但清理迁移目录失败：{}", error.user_message()),
+            };
+            send_log_and_toast(&state.event_sender, CoreLogLevel::Warning, message);
+        }
+    }
+}
+
+/// 编辑写回的结果，决定是否要撤销已完成的目录迁移。
+enum EditOutcome {
+    /// 已写入并持久化。
+    Applied,
+    /// 任务在迁移期间已不存在，迁移产生的目录需要撤销。
+    TaskGone,
+    /// 分片已迁移到位但持久化失败，不能撤销，否则会连分片一起删掉。
+    SaveFailed,
+}
+
+/// 把编辑后的 manifest 写回任务并推送快照。
+fn apply_edited_manifest(state: &ManagerState, id: u64, updated: TaskManifest) -> EditOutcome {
+    let Ok(mut tasks) = state.tasks.lock() else {
+        return EditOutcome::SaveFailed;
+    };
+    let Some(runtime) = tasks.get_mut(&id) else {
+        return EditOutcome::TaskGone;
+    };
+    runtime.manifest = updated;
+    if let Err(error) = runtime.manifest.save() {
+        drop(tasks);
+        send_log_and_toast(
+            &state.event_sender,
+            CoreLogLevel::Error,
+            format!("编辑失败：{}", error.user_message()),
+        );
+        return EditOutcome::SaveFailed;
+    }
+    runtime.snapshot.source_url = runtime.manifest.source_url.clone();
+    runtime.snapshot.output_name = runtime.manifest.output_name.clone();
+    runtime.snapshot.output_directory = runtime
+        .manifest
+        .output_directory
+        .to_string_lossy()
+        .into_owned();
+    runtime.snapshot.request_headers = runtime.manifest.request_headers_json();
+    let snapshot = runtime.snapshot.clone();
+    drop(tasks);
+    let _ = state.event_sender.send(TaskEvent::Snapshot(snapshot));
+    let _ = state.event_sender.send(TaskEvent::Log {
+        level: CoreLogLevel::Info,
+        message: "任务已更新".to_string(),
+    });
+    EditOutcome::Applied
 }
 
 /// 迁移任务临时目录，跨盘符时 rename 会失败，退化为复制后删除。

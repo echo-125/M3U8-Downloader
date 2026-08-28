@@ -51,7 +51,11 @@ impl PlaylistFetcher {
                 }
             }
         }
-        Err(CoreError::InvalidPlaylist)
+        // 超过层数上限通常是主播放列表循环引用或结构异常，要说清真实原因。
+        // 枚举的 Display 自带「播放列表无效：」前缀，这里不再重复「播放列表」。
+        Err(CoreError::InvalidPlaylistDetail(format!(
+            "嵌套超过 {MAX_PLAYLIST_DEPTH} 层，可能是循环引用或结构异常"
+        )))
     }
 
     pub async fn fetch_text(&self, url: &str) -> Result<String, CoreError> {
