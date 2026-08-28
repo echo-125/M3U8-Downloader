@@ -9,16 +9,26 @@ use self::{
     theme::{apply, install_fonts},
     tray::{TrayAction, TrayController},
 };
+use std::time::Instant;
+
 use eframe::egui::{self, ViewportCommand};
+
+use crate::config::Settings;
 
 pub struct CatCatchApp {
     state: AppState,
     tray: Option<TrayController>,
+    window_size_dirty: bool,
+    last_window_size_saved: Instant,
 }
 
 impl CatCatchApp {
-    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
-        let mut state = AppState::new();
+    pub fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        settings: Settings,
+        load_warning: Option<String>,
+    ) -> Self {
+        let mut state = AppState::new(settings, load_warning);
         if let Some(warning) = install_fonts(&creation_context.egui_ctx) {
             state.logs.push_warning(warning);
         }
@@ -29,7 +39,12 @@ impl CatCatchApp {
                 None
             }
         };
-        Self { state, tray }
+        Self {
+            state,
+            tray,
+            window_size_dirty: false,
+            last_window_size_saved: Instant::now(),
+        }
     }
 
     fn request_exit(&mut self, ctx: &egui::Context) {
@@ -51,10 +66,37 @@ impl eframe::App for CatCatchApp {
         render(ctx, &mut self.state);
         self.process_tray(ctx);
         self.handle_close_request(ctx);
+        self.sync_window_size(ctx);
         // 只在有任务在跑或有 Toast 需要消失时高频重绘，空闲时降低到 1 秒一次。
         let idle = self.state.active_task_count() == 0 && self.state.toast.is_none();
         let interval = if idle { 1000 } else { 200 };
         ctx.request_repaint_after(std::time::Duration::from_millis(interval));
+    }
+}
+
+impl CatCatchApp {
+    /// 记录窗口尺寸变化并防抖落盘，下次启动时按上次尺寸恢复。
+    fn sync_window_size(&mut self, ctx: &egui::Context) {
+        let Some(rect) = ctx.input(|input| input.viewport().inner_rect) else {
+            return;
+        };
+        let width = rect.width().round().clamp(820.0, 4096.0);
+        let height = rect.height().round().clamp(560.0, 4096.0);
+        let appearance = &mut self.state.settings.appearance;
+        if (appearance.window_width - width).abs() >= 1.0
+            || (appearance.window_height - height).abs() >= 1.0
+        {
+            appearance.window_width = width;
+            appearance.window_height = height;
+            self.window_size_dirty = true;
+        }
+        if self.window_size_dirty
+            && self.last_window_size_saved.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            self.state.persist_settings();
+            self.window_size_dirty = false;
+            self.last_window_size_saved = Instant::now();
+        }
     }
 }
 

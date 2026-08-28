@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use futures_util::{future::ready, stream, StreamExt, TryStreamExt};
 use tokio::{
-    sync::{mpsc::UnboundedSender, Semaphore},
+    io::AsyncWriteExt,
+    sync::{mpsc::UnboundedSender, OwnedSemaphorePermit, Semaphore},
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
@@ -36,12 +37,25 @@ pub struct DownloadTask {
     pub global_permits: Arc<Semaphore>,
 }
 
+/// 超过该体积且不需要解密的分片改为流式写盘，避免整片驻留内存。
+const STREAM_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
+/// 用于格式识别的头部采样长度。
+const HEADER_SAMPLE_BYTES: usize = 16;
+
 #[derive(Debug)]
 struct DownloadProgress {
     completed: usize,
     downloaded_bytes: u64,
+    /// 解密失败但仍继续写入的分片数量。
+    undecrypted_segments: usize,
     started_at: Instant,
     last_event_at: Instant,
+}
+
+/// 已完成重试的响应，读取响应体期间仍需持有并发许可。
+struct SegmentResponse {
+    response: reqwest::Response,
+    _permit: OwnedSemaphorePermit,
 }
 
 pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
@@ -79,6 +93,7 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
     let progress = Arc::new(Mutex::new(DownloadProgress {
         completed: initial_completed,
         downloaded_bytes: 0,
+        undecrypted_segments: 0,
         started_at: Instant::now(),
         last_event_at: Instant::now() - Duration::from_millis(200),
     }));
@@ -97,7 +112,7 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
     if let Some(initialization) = &playlist.initialization {
         let initialization_path = manifest.initialization_path();
         if !initialization_path.is_file() {
-            let data = fetch_with_retries(
+            let fetched = fetch_with_retries(
                 &fetcher,
                 &initialization.url,
                 initialization.byte_range,
@@ -105,6 +120,12 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
                 &global_permits,
             )
             .await?;
+            let data = fetched
+                .response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|_| CoreError::Network("读取初始化段失败".into()))?;
             write_atomic(&initialization_path, &data).await?;
         }
     }
@@ -190,7 +211,30 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
         }
     }
 
-    let mut snapshot = base_snapshot(&manifest, TaskStatus::Completed, &merge_result.message);
+    let undecrypted_segments = progress
+        .lock()
+        .map(|progress| progress.undecrypted_segments)
+        .unwrap_or(0);
+    let completion_message = if undecrypted_segments == 0 {
+        merge_result.message.clone()
+    } else {
+        format!(
+            "{}，但 {} 个分片解密失败，输出文件可能损坏",
+            merge_result.message, undecrypted_segments
+        )
+    };
+    if undecrypted_segments > 0 {
+        emit_log(
+            &event_sender,
+            CoreLogLevel::Error,
+            format!(
+                "任务完成但存在解密失败：{}，共 {} 个分片，原始密文已保存到 _debug 目录",
+                manifest.output_name, undecrypted_segments
+            ),
+        );
+    }
+
+    let mut snapshot = base_snapshot(&manifest, TaskStatus::Completed, &completion_message);
     snapshot.completed_segments = total_segments;
     snapshot.total_segments = total_segments;
     snapshot.progress = 1.0;
@@ -264,7 +308,7 @@ async fn download_one_segment(
     if cancellation_token.is_cancelled() {
         return Err(CoreError::Canceled);
     }
-    let mut data = fetch_with_retries(
+    let fetched = fetch_with_retries(
         fetcher,
         &segment.url,
         segment.byte_range,
@@ -273,6 +317,24 @@ async fn download_one_segment(
     )
     .await?;
 
+    // 未加密的大分片直接流式落盘，避免整片驻留内存。
+    let stream_to_disk = segment.encryption.is_none()
+        && fetched.response.content_length().unwrap_or(0) > STREAM_THRESHOLD_BYTES;
+    if stream_to_disk {
+        let size =
+            stream_segment_to_disk(fetched.response, &manifest.segment_path(segment.index)).await?;
+        record_progress(manifest, progress, event_sender, size)?;
+        return Ok(());
+    }
+
+    let mut data = fetched
+        .response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|_| CoreError::Network("读取分片失败".into()))?;
+
+    let mut decrypted = true;
     if let Some(encryption) = &segment.encryption {
         let key = key_cache
             .get(&encryption.key_uri)
@@ -286,28 +348,64 @@ async fn download_one_segment(
                 .unwrap_or_else(|| implicit_iv(0, segment.index))
         });
         match decrypt_aes128_cbc(&data, &key, iv) {
-            Ok(decrypted) => data = decrypted,
+            Ok(result) => data = result,
             Err(error) => {
-                let encrypted_path = manifest.segment_path(segment.index).with_extension("enc");
-                let _ = write_atomic(&encrypted_path, &data).await;
-                return Err(error);
+                // 解密失败不中断整个任务：保留原始密文供排查，继续下载其余分片。
+                decrypted = false;
+                if let Ok(mut progress) = progress.lock() {
+                    progress.undecrypted_segments += 1;
+                }
+                let _ = tokio::fs::create_dir_all(manifest.debug_directory()).await;
+                let _ = write_atomic(&manifest.debug_path(segment.index), &data).await;
+                emit_log(
+                    event_sender,
+                    CoreLogLevel::Error,
+                    format!(
+                        "分片 {} 解密失败：{}，已保留原始密文",
+                        segment.index + 1,
+                        error.user_message()
+                    ),
+                );
             }
         }
     }
 
     match detect_format(&data) {
         SegmentFormat::Ts | SegmentFormat::Fmp4 => {}
-        _ => return Err(CoreError::InvalidSegment(diagnostic_message(&data))),
+        other => {
+            if decrypted {
+                return Err(CoreError::InvalidSegment(diagnostic_message(&data)));
+            }
+            emit_log(
+                event_sender,
+                CoreLogLevel::Warning,
+                format!(
+                    "分片 {} 解密失败，内容为{}",
+                    segment.index + 1,
+                    other.label()
+                ),
+            );
+        }
     }
 
     write_atomic(&manifest.segment_path(segment.index), &data).await?;
+    record_progress(manifest, progress, event_sender, data.len() as u64)?;
+    Ok(())
+}
+
+fn record_progress(
+    manifest: &TaskManifest,
+    progress: &Arc<Mutex<DownloadProgress>>,
+    event_sender: &UnboundedSender<TaskEvent>,
+    bytes: u64,
+) -> Result<(), CoreError> {
     let should_emit;
     {
         let mut progress = progress
             .lock()
             .map_err(|_| CoreError::Io("更新进度失败".into()))?;
         progress.completed += 1;
-        progress.downloaded_bytes += data.len() as u64;
+        progress.downloaded_bytes += bytes;
         should_emit = progress.last_event_at.elapsed() >= Duration::from_millis(100);
         if should_emit {
             progress.last_event_at = Instant::now();
@@ -321,13 +419,62 @@ async fn download_one_segment(
     Ok(())
 }
 
+/// 边下载边写入磁盘，只在内存中保留用于格式识别的头部样本。
+async fn stream_segment_to_disk(
+    response: reqwest::Response,
+    path: &Path,
+) -> Result<u64, CoreError> {
+    let part_path = path.with_extension("part");
+    if part_path.exists() {
+        tokio::fs::remove_file(&part_path)
+            .await
+            .map_err(|_| CoreError::Io("清理临时分片失败".into()))?;
+    }
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|_| CoreError::Io("创建分片失败".into()))?;
+    let mut header = Vec::with_capacity(HEADER_SAMPLE_BYTES);
+    let mut total = 0_u64;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| CoreError::Network("下载分片中断".into()))?;
+        if header.len() < HEADER_SAMPLE_BYTES {
+            let take = (HEADER_SAMPLE_BYTES - header.len()).min(chunk.len());
+            header.extend_from_slice(&chunk[..take]);
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| CoreError::Io("写入分片失败".into()))?;
+        total += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|_| CoreError::Io("写入分片失败".into()))?;
+    drop(file);
+
+    match detect_format(&header) {
+        SegmentFormat::Ts | SegmentFormat::Fmp4 => {}
+        other => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(CoreError::InvalidSegment(format!(
+                "分片内容异常，检测到{}",
+                other.label()
+            )));
+        }
+    }
+    tokio::fs::rename(&part_path, path)
+        .await
+        .map_err(|_| CoreError::Io("保存分片失败".into()))?;
+    Ok(total)
+}
+
 async fn fetch_with_retries(
     fetcher: &Arc<PlaylistFetcher>,
     url: &str,
     byte_range: Option<ByteRange>,
     cancellation_token: &CancellationToken,
     global_permits: &Arc<Semaphore>,
-) -> Result<Vec<u8>, CoreError> {
+) -> Result<SegmentResponse, CoreError> {
     let range = byte_range.map(|range| {
         let offset = range.offset.unwrap_or(0);
         format!(
@@ -341,8 +488,8 @@ async fn fetch_with_retries(
         if cancellation_token.is_cancelled() {
             return Err(CoreError::Canceled);
         }
-        let _permit = tokio::select! {
-            permit = global_permits.acquire() => {
+        let permit = tokio::select! {
+            permit = global_permits.clone().acquire_owned() => {
                 permit.map_err(|_| CoreError::Io("获取下载并发许可失败".into()))?
             }
             _ = cancellation_token.cancelled() => return Err(CoreError::Canceled),
@@ -352,11 +499,10 @@ async fn fetch_with_retries(
             Ok(response) => {
                 let status = response.status().as_u16();
                 if (200..300).contains(&status) {
-                    return response
-                        .bytes()
-                        .await
-                        .map(|bytes| bytes.to_vec())
-                        .map_err(|_| CoreError::Network("读取分片失败".into()));
+                    return Ok(SegmentResponse {
+                        response,
+                        _permit: permit,
+                    });
                 }
                 let retry_after = response
                     .headers()
@@ -394,7 +540,7 @@ async fn fetch_with_retries(
     }
 }
 
-fn status_error(status: u16) -> Result<Vec<u8>, CoreError> {
+fn status_error(status: u16) -> Result<SegmentResponse, CoreError> {
     Err(match status {
         403 => CoreError::Forbidden,
         404 => CoreError::NotFound,
@@ -446,6 +592,7 @@ fn base_snapshot(manifest: &TaskManifest, status: TaskStatus, detail: &str) -> T
         source_url: manifest.source_url.clone(),
         output_name: manifest.output_name.clone(),
         output_directory: manifest.output_directory.to_string_lossy().into_owned(),
+        request_headers: manifest.request_headers_json(),
         status,
         completed_segments,
         total_segments,
@@ -486,6 +633,7 @@ fn progress_snapshot(
         source_url: manifest.source_url.clone(),
         output_name: manifest.output_name.clone(),
         output_directory: manifest.output_directory.to_string_lossy().into_owned(),
+        request_headers: manifest.request_headers_json(),
         status,
         completed_segments: progress.completed,
         total_segments,

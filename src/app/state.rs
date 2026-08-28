@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     config::{default_config_path, ProxyScheme, Settings, ThemeKind},
     core::{
-        events::{CoreLogLevel, NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
+        events::{CoreLogLevel, NewTask, TaskCommand, TaskEvent, TaskSnapshot},
         manager::TaskManager,
         merge::{sanitize_filename, MergeScanResult},
         task::{TaskRegistry, TASK_REGISTRY_FILE_NAME},
@@ -36,6 +36,8 @@ pub struct EditTask {
     pub id: u64,
     pub source_url: String,
     pub output_name: String,
+    pub output_directory: String,
+    pub request_headers: String,
 }
 
 pub struct AppState {
@@ -60,7 +62,8 @@ pub struct AppState {
     pub tasks: Vec<TaskSnapshot>,
     pub logs: LogBuffer,
     pub settings_open: bool,
-    pub selected_task_id: Option<u64>,
+    /// 任务列表支持多选，最后一个被选中的作为编辑等单选操作的默认目标。
+    pub selected_task_ids: Vec<u64>,
     pub toast: Option<Toast>,
     pub show_exit_confirmation: bool,
     pub edit_task: Option<EditTask>,
@@ -69,9 +72,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    /// `settings` 与 `load_warning` 由入口统一加载后传入，避免重复读取配置文件。
+    pub fn new(settings: Settings, load_warning: Option<String>) -> Self {
         let config_path = default_config_path();
-        let (settings, warning) = Settings::load_or_default(Some(&config_path));
         let download_path = settings.normalized_download_path();
         let task_registry_path = config_path.with_file_name(TASK_REGISTRY_FILE_NAME);
         let registry_warning;
@@ -94,7 +97,7 @@ impl AppState {
 
         let mut logs = LogBuffer::default();
         logs.push_info("日志系统已就绪");
-        if let Some(warning) = warning {
+        if let Some(warning) = load_warning {
             logs.push_warning(warning);
         }
         if let Some(warning) = registry_warning {
@@ -122,7 +125,7 @@ impl AppState {
             tasks: Vec::new(),
             logs,
             settings_open: false,
-            selected_task_id: None,
+            selected_task_ids: Vec::new(),
             toast: None,
             show_exit_confirmation: false,
             edit_task: None,
@@ -390,6 +393,59 @@ impl AppState {
         self.manager.send(TaskCommand::Retry(id));
     }
 
+    pub fn is_task_selected(&self, id: u64) -> bool {
+        self.selected_task_ids.contains(&id)
+    }
+
+    /// 按住 Ctrl 或 Shift 点击为增减选择，否则只选中当前行。
+    pub fn select_task(&mut self, id: u64, additive: bool) {
+        if !additive {
+            self.selected_task_ids = vec![id];
+            return;
+        }
+        match self
+            .selected_task_ids
+            .iter()
+            .position(|selected| *selected == id)
+        {
+            Some(index) => {
+                self.selected_task_ids.remove(index);
+            }
+            None => self.selected_task_ids.push(id),
+        }
+    }
+
+    pub fn select_all_tasks(&mut self) {
+        self.selected_task_ids = self.tasks.iter().map(|task| task.id).collect();
+    }
+
+    pub fn start_selected_tasks(&mut self) {
+        for id in self.selected_task_ids.clone() {
+            self.manager.send(TaskCommand::Start(id));
+        }
+    }
+
+    pub fn cancel_selected_tasks(&mut self) {
+        for id in self.selected_task_ids.clone() {
+            self.manager.send(TaskCommand::Cancel(id));
+        }
+    }
+
+    pub fn retry_selected_tasks(&mut self) {
+        for id in self.selected_task_ids.clone() {
+            self.manager.send(TaskCommand::Retry(id));
+        }
+    }
+
+    pub fn delete_selected_tasks(&mut self) {
+        let ids = self.selected_task_ids.clone();
+        for id in &ids {
+            self.manager.send(TaskCommand::Delete(*id));
+        }
+        self.tasks.retain(|task| !ids.contains(&task.id));
+        self.selected_task_ids.clear();
+    }
+
     pub fn save_edited_task(&mut self) {
         let Some(edit) = self.edit_task.clone() else {
             return;
@@ -403,10 +459,16 @@ impl AppState {
             self.logs.push_error("编辑失败：文件名不能为空");
             return;
         }
+        if edit.output_directory.trim().is_empty() {
+            self.logs.push_error("编辑失败：保存路径不能为空");
+            return;
+        }
         self.manager.send(TaskCommand::EditTask {
             id: edit.id,
             source_url: edit.source_url.trim().to_string(),
             output_name: edit.output_name.trim().to_string(),
+            output_directory: edit.output_directory.trim().to_string(),
+            request_headers: edit.request_headers.trim().to_string(),
         });
         self.edit_task = None;
     }
@@ -414,15 +476,53 @@ impl AppState {
     pub fn delete_task(&mut self, id: u64) {
         self.manager.send(TaskCommand::Delete(id));
         self.tasks.retain(|task| task.id != id);
-        if self.selected_task_id == Some(id) {
-            self.selected_task_id = None;
-        }
+        self.selected_task_ids.retain(|selected| *selected != id);
     }
 
-    pub fn clear_completed_tasks(&mut self) {
-        self.manager.send(TaskCommand::ClearCompleted);
-        self.tasks
-            .retain(|task| task.status != TaskStatus::Completed);
+    /// 清除所有已结束的任务：已完成、已失败、已取消。
+    pub fn clear_finished_tasks(&mut self) {
+        self.manager.send(TaskCommand::ClearFinished);
+        self.tasks.retain(|task| task.status.is_active());
+        self.selected_task_ids.clear();
+    }
+
+    /// 从剪贴板粘贴任务信息，支持 `链接|文件名|请求头JSON` 的增强格式。
+    pub fn paste_from_clipboard(&mut self) {
+        let Some(text) = clipboard_text() else {
+            self.logs.push_error("粘贴失败：无法读取剪贴板");
+            return;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.logs.push_warning("剪贴板为空");
+            return;
+        }
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        let url = parts[0].trim();
+        if !is_valid_http_url(url) {
+            self.logs
+                .push_error("粘贴失败：剪贴板内容不是有效的 M3U8 链接");
+            return;
+        }
+        self.single_url = url.to_string();
+        if let Some(name) = parts.get(1).map(|value| value.trim()) {
+            if !name.is_empty() {
+                self.single_name = (*name).to_string();
+            }
+        }
+        if let Some(headers) = parts.get(2).map(|value| value.trim()) {
+            if !headers.is_empty() {
+                self.single_headers = (*headers).to_string();
+            }
+        }
+        self.logs.push_info("已从剪贴板粘贴链接");
+    }
+
+    /// 保存配置但不写日志、不通知核心，用于窗口尺寸这类高频变更。
+    pub fn persist_settings(&self) {
+        if let Err(error) = self.settings.save(Some(&self.config_path)) {
+            tracing::warn!("配置保存失败：{error}");
+        }
     }
 
     pub fn open_task_directory(&mut self, snapshot: &TaskSnapshot) {
@@ -494,6 +594,12 @@ pub fn derive_output_name(url: &str) -> String {
         .filter(|segment| !segment.is_empty())
         .unwrap_or_else(|| "video".to_string());
     sanitize_filename(name.trim_end_matches(".m3u8"))
+}
+
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut clipboard| clipboard.get_text().ok())
 }
 
 #[cfg(test)]

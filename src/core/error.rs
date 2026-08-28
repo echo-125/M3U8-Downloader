@@ -8,6 +8,8 @@ pub enum CoreError {
     LiveStream,
     #[error("播放列表格式无效")]
     InvalidPlaylist,
+    #[error("播放列表无效：{0}")]
+    InvalidPlaylistDetail(String),
     #[error("网络请求失败：{0}")]
     Network(String),
     #[error("服务器返回错误：{status}")]

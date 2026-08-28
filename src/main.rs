@@ -11,13 +11,16 @@ fn main() -> eframe::Result {
     let (settings, warning) = Settings::load_or_default(None);
     let _logging_guard = logging::init(&settings.logging);
     tracing::info!("应用启动");
-    if let Some(warning) = warning {
-        tracing::warn!("{warning}");
+    if let Some(message) = &warning {
+        tracing::warn!("{message}");
     }
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 720.0])
+            .with_inner_size([
+                settings.appearance.window_width,
+                settings.appearance.window_height,
+            ])
             .with_min_inner_size([820.0, 560.0])
             .with_icon(load_icon()),
         ..Default::default()
@@ -26,7 +29,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Cat Catch Assistant",
         options,
-        Box::new(|creation_context| Ok(Box::new(CatCatchApp::new(creation_context)))),
+        Box::new(move |creation_context| {
+            Ok(Box::new(CatCatchApp::new(
+                creation_context,
+                settings,
+                warning,
+            )))
+        }),
     )
 }
 

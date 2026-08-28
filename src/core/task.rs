@@ -10,6 +10,7 @@ use crate::core::{error::CoreError, merge::sanitize_filename, playlist::MediaPla
 
 pub const TASK_DIRECTORY_NAME: &str = ".cat-catch-tasks";
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
+pub const DEBUG_DIRECTORY_NAME: &str = "_debug";
 pub const TASK_REGISTRY_FILE_NAME: &str = "tasks.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +24,9 @@ pub struct TaskManifest {
     pub playlist: Option<MediaPlaylist>,
     #[serde(default)]
     pub completed: bool,
+    /// 被用户从列表清除的未完成任务，重启后不再自动续传。
+    #[serde(default)]
+    pub dismissed: bool,
     #[serde(default)]
     pub output_path: Option<PathBuf>,
 }
@@ -49,6 +53,7 @@ impl TaskManifest {
             request_headers,
             playlist: None,
             completed: false,
+            dismissed: false,
             output_path: None,
         };
         manifest.save()?;
@@ -85,6 +90,16 @@ impl TaskManifest {
         self.task_directory().join("init.mp4")
     }
 
+    /// 解密失败分片的归档目录，用于事后排查密钥或 IV 问题。
+    pub fn debug_directory(&self) -> PathBuf {
+        self.task_directory().join(DEBUG_DIRECTORY_NAME)
+    }
+
+    pub fn debug_path(&self, index: usize) -> PathBuf {
+        self.debug_directory()
+            .join(format!("undecrypted_{index:05}.bin"))
+    }
+
     pub fn completed_segment_count(&self) -> Result<usize, CoreError> {
         let Some(playlist) = &self.playlist else {
             return Ok(0);
@@ -98,6 +113,11 @@ impl TaskManifest {
         Ok(completed)
     }
 
+    /// 请求头的 JSON 文本形式，供界面编辑使用。
+    pub fn request_headers_json(&self) -> String {
+        serde_json::to_string(&self.request_headers).unwrap_or_default()
+    }
+
     pub fn total_segment_count(&self) -> usize {
         self.playlist
             .as_ref()
@@ -108,6 +128,12 @@ impl TaskManifest {
     pub fn mark_completed(&mut self, output_path: PathBuf) -> Result<(), CoreError> {
         self.completed = true;
         self.output_path = Some(output_path);
+        self.save()
+    }
+
+    /// 标记任务已被用户清除，避免重启后重新载入。
+    pub fn mark_dismissed(&mut self) -> Result<(), CoreError> {
+        self.dismissed = true;
         self.save()
     }
 }

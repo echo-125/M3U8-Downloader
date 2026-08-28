@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -146,8 +146,17 @@ async fn manager_loop(
                 id,
                 source_url,
                 output_name,
-            } => edit_task(&state, id, source_url, output_name),
-            TaskCommand::ClearCompleted => clear_completed_tasks(&state),
+                output_directory,
+                request_headers,
+            } => edit_task(
+                &state,
+                id,
+                source_url,
+                output_name,
+                output_directory,
+                request_headers,
+            ),
+            TaskCommand::ClearFinished => clear_finished_tasks(&state),
             TaskCommand::ResumeTasks(directories) => resume_tasks(&state, directories),
             TaskCommand::UpdateSettings(new_settings) => update_settings(&state, new_settings),
             TaskCommand::DetectFfmpeg => {
@@ -381,6 +390,7 @@ fn task_snapshot(tasks: &Arc<Mutex<HashMap<u64, TaskRuntime>>>, id: u64) -> Task
             source_url: String::new(),
             output_name: String::new(),
             output_directory: String::new(),
+            request_headers: String::new(),
             status: TaskStatus::Failed,
             completed_segments: 0,
             total_segments: 0,
@@ -481,7 +491,14 @@ fn delete_task(state: &ManagerState, id: u64) {
     });
 }
 
-fn edit_task(state: &ManagerState, id: u64, source_url: String, output_name: String) {
+fn edit_task(
+    state: &ManagerState,
+    id: u64,
+    source_url: String,
+    output_name: String,
+    output_directory: String,
+    request_headers: String,
+) {
     if Url::parse(&source_url).is_err() {
         send_log_and_toast(
             &state.event_sender,
@@ -490,6 +507,27 @@ fn edit_task(state: &ManagerState, id: u64, source_url: String, output_name: Str
         );
         return;
     }
+    let request_headers = match parse_header_json(&request_headers) {
+        Ok(headers) => headers,
+        Err(error) => {
+            send_log_and_toast(
+                &state.event_sender,
+                CoreLogLevel::Error,
+                format!("编辑失败：{}", error.user_message()),
+            );
+            return;
+        }
+    };
+    if output_directory.trim().is_empty() {
+        send_log_and_toast(
+            &state.event_sender,
+            CoreLogLevel::Error,
+            "编辑失败：保存路径不能为空".to_string(),
+        );
+        return;
+    }
+    let output_directory = PathBuf::from(output_directory.trim());
+
     if let Ok(mut tasks) = state.tasks.lock() {
         let Some(runtime) = tasks.get_mut(&id) else {
             return;
@@ -502,8 +540,25 @@ fn edit_task(state: &ManagerState, id: u64, source_url: String, output_name: Str
             );
             return;
         }
-        runtime.manifest.source_url = source_url;
-        runtime.manifest.output_name = sanitize_filename(&output_name);
+        let mut updated = runtime.manifest.clone();
+        updated.source_url = source_url;
+        updated.output_name = sanitize_filename(&output_name);
+        updated.output_directory = output_directory;
+        updated.request_headers = request_headers;
+        // 输出名或保存目录变化后任务目录随之变化，必须迁移已下载的分片。
+        let previous_directory = runtime.manifest.task_directory();
+        let current_directory = updated.task_directory();
+        if previous_directory != current_directory && previous_directory.is_dir() {
+            if let Err(error) = move_task_directory(&previous_directory, &current_directory) {
+                send_log_and_toast(
+                    &state.event_sender,
+                    CoreLogLevel::Error,
+                    format!("编辑失败：{}", error.user_message()),
+                );
+                return;
+            }
+        }
+        runtime.manifest = updated;
         if let Err(error) = runtime.manifest.save() {
             send_log_and_toast(
                 &state.event_sender,
@@ -514,6 +569,12 @@ fn edit_task(state: &ManagerState, id: u64, source_url: String, output_name: Str
         }
         runtime.snapshot.source_url = runtime.manifest.source_url.clone();
         runtime.snapshot.output_name = runtime.manifest.output_name.clone();
+        runtime.snapshot.output_directory = runtime
+            .manifest
+            .output_directory
+            .to_string_lossy()
+            .into_owned();
+        runtime.snapshot.request_headers = runtime.manifest.request_headers_json();
         let snapshot = runtime.snapshot.clone();
         drop(tasks);
         let _ = state.event_sender.send(TaskEvent::Snapshot(snapshot));
@@ -524,10 +585,78 @@ fn edit_task(state: &ManagerState, id: u64, source_url: String, output_name: Str
     }
 }
 
-fn clear_completed_tasks(state: &ManagerState) {
-    if let Ok(mut tasks) = state.tasks.lock() {
-        tasks.retain(|_, runtime| runtime.snapshot.status != TaskStatus::Completed);
+/// 迁移任务临时目录，跨盘符时 rename 会失败，退化为复制后删除。
+fn move_task_directory(from: &Path, to: &Path) -> Result<(), CoreError> {
+    if from == to {
+        return Ok(());
     }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| CoreError::Io("创建任务目录失败".into()))?;
+    }
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    copy_directory(from, to)?;
+    safe_remove_directory(from)
+}
+
+fn copy_directory(from: &Path, to: &Path) -> Result<(), CoreError> {
+    std::fs::create_dir_all(to).map_err(|_| CoreError::Io("创建任务目录失败".into()))?;
+    let entries = std::fs::read_dir(from).map_err(|_| CoreError::Io("读取任务目录失败".into()))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| CoreError::Io("读取任务目录失败".into()))?;
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_directory(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target).map_err(|_| CoreError::Io("迁移任务分片失败".into()))?;
+        }
+    }
+    Ok(())
+}
+
+/// 清除所有已结束的任务（已完成、已失败、已取消）。
+fn clear_finished_tasks(state: &ManagerState) {
+    let removed: Vec<TaskRuntime> = {
+        let Ok(mut tasks) = state.tasks.lock() else {
+            return;
+        };
+        let finished: Vec<u64> = tasks
+            .values()
+            .filter(|runtime| !runtime.snapshot.status.is_active())
+            .map(|runtime| runtime.manifest.id)
+            .collect();
+        finished.iter().filter_map(|id| tasks.remove(id)).collect()
+    };
+    if removed.is_empty() {
+        return;
+    }
+    let mut dismissed = 0;
+    for runtime in &removed {
+        runtime.cancellation_token.cancel();
+        runtime.handle.abort();
+        // 未完成的任务被清除后要打标记，否则重启后会被断点续传重新载入。
+        if !runtime.manifest.completed {
+            let mut manifest = runtime.manifest.clone();
+            if let Err(error) = manifest.mark_dismissed() {
+                let _ = state.event_sender.send(TaskEvent::Log {
+                    level: CoreLogLevel::Warning,
+                    message: format!("标记已清除任务失败：{}", error.user_message()),
+                });
+                continue;
+            }
+            dismissed += 1;
+        }
+    }
+    let _ = state.event_sender.send(TaskEvent::Log {
+        level: CoreLogLevel::Info,
+        message: format!(
+            "已清除 {} 个已结束的任务，其中 {} 个未完成任务不再自动续传",
+            removed.len(),
+            dismissed
+        ),
+    });
 }
 
 fn resume_tasks(state: &ManagerState, directories: Vec<PathBuf>) {
@@ -541,7 +670,7 @@ fn resume_tasks(state: &ManagerState, directories: Vec<PathBuf>) {
         return;
     }
     for manifest in manifests {
-        if manifest.completed {
+        if manifest.completed || manifest.dismissed {
             continue;
         }
         if state.next_id.load(Ordering::Relaxed) <= manifest.id {
@@ -580,6 +709,7 @@ fn initial_snapshot(manifest: &TaskManifest) -> TaskSnapshot {
         source_url: manifest.source_url.clone(),
         output_name: manifest.output_name.clone(),
         output_directory: manifest.output_directory.to_string_lossy().into_owned(),
+        request_headers: manifest.request_headers_json(),
         status: TaskStatus::Waiting,
         completed_segments,
         total_segments,

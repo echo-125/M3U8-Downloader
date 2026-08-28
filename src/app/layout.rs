@@ -8,7 +8,7 @@ use super::{
     theme::switch_label,
 };
 use crate::config::ProxyScheme;
-use crate::core::events::TaskStatus;
+use crate::core::events::{TaskSnapshot, TaskStatus};
 
 pub fn render(ctx: &egui::Context, state: &mut AppState) {
     render_title_bar(ctx, state);
@@ -109,9 +109,12 @@ fn render_single_task_form(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label("M3U8 链接");
         ui.add(
             egui::TextEdit::singleline(&mut state.single_url)
-                .hint_text("https://example.com/video.m3u8")
+                .hint_text("https://example.com/video.m3u8 或 链接|文件名|请求头JSON")
                 .desired_width(ui.available_width() - 70.0),
         );
+        if ui.button("粘贴").clicked() {
+            state.paste_from_clipboard();
+        }
     });
     ui.horizontal(|ui| {
         ui.label("保存路径");
@@ -240,34 +243,50 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.heading("任务列表");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("清除已完成").clicked() {
-                    state.clear_completed_tasks();
+                if ui
+                    .add_enabled(
+                        !state.selected_task_ids.is_empty(),
+                        egui::Button::new("删除"),
+                    )
+                    .clicked()
+                {
+                    state.delete_selected_tasks();
                 }
-                if ui.button("删除").clicked() {
-                    if let Some(id) = state.selected_task_id {
-                        state.delete_task(id);
-                    }
+                if ui
+                    .add_enabled(
+                        !state.selected_task_ids.is_empty(),
+                        egui::Button::new("重试"),
+                    )
+                    .clicked()
+                {
+                    state.retry_selected_tasks();
                 }
-                if ui.button("重试").clicked() {
-                    if let Some(id) = state.selected_task_id {
-                        state.retry_task(id);
-                    }
-                }
-                if ui.button("取消").clicked() {
-                    if let Some(id) = state.selected_task_id {
-                        state.cancel_task(id);
-                    }
+                if ui
+                    .add_enabled(
+                        !state.selected_task_ids.is_empty(),
+                        egui::Button::new("取消"),
+                    )
+                    .clicked()
+                {
+                    state.cancel_selected_tasks();
                 }
                 if ui.button("全部开始").clicked() {
                     state.start_all_tasks();
                 }
                 if ui
-                    .add_enabled(state.selected_task_id.is_some(), egui::Button::new("开始"))
+                    .add_enabled(
+                        !state.selected_task_ids.is_empty(),
+                        egui::Button::new("开始"),
+                    )
                     .clicked()
                 {
-                    if let Some(id) = state.selected_task_id {
-                        state.start_task(id);
-                    }
+                    state.start_selected_tasks();
+                }
+                if !state.tasks.is_empty() && ui.button("全选").clicked() {
+                    state.select_all_tasks();
+                }
+                if ui.button("清除已结束").clicked() {
+                    state.clear_finished_tasks();
                 }
             });
         });
@@ -294,10 +313,12 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
 
                 for index in 0..state.tasks.len() {
                     let task = state.tasks[index].clone();
-                    let selected = state.selected_task_id == Some(task.id);
+                    let selected = state.is_task_selected(task.id);
                     let response = ui.selectable_label(selected, &task.output_name);
                     if response.clicked() {
-                        state.selected_task_id = Some(task.id);
+                        let additive =
+                            ui.input(|input| input.modifiers.ctrl || input.modifiers.shift);
+                        state.select_task(task.id, additive);
                     }
                     if response.double_clicked() {
                         match task.status {
@@ -311,38 +332,11 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
                         }
                     }
                     response.context_menu(|ui| {
-                        if ui.button("开始").clicked() {
-                            state.start_task(task.id);
-                            ui.close_menu();
+                        // 右键未选中的行时，只把这一行作为操作目标。
+                        if !state.is_task_selected(task.id) {
+                            state.selected_task_ids = vec![task.id];
                         }
-                        if ui.button("取消").clicked() {
-                            state.cancel_task(task.id);
-                            ui.close_menu();
-                        }
-                        if ui.button("编辑").clicked() {
-                            state.edit_task = Some(EditTask {
-                                id: task.id,
-                                source_url: task.source_url.clone(),
-                                output_name: task.output_name.clone(),
-                            });
-                            ui.close_menu();
-                        }
-                        if ui.button("重试").clicked() {
-                            state.retry_task(task.id);
-                            ui.close_menu();
-                        }
-                        if ui.button("删除").clicked() {
-                            state.delete_task(task.id);
-                            ui.close_menu();
-                        }
-                        if ui.button("复制链接").clicked() {
-                            ui.output_mut(|writer| writer.copied_text = task.source_url.clone());
-                            ui.close_menu();
-                        }
-                        if ui.button("打开目录").clicked() {
-                            state.open_task_directory(&task);
-                            ui.close_menu();
-                        }
+                        context_menu(ui, state, &task);
                     });
                     status_label(ui, task.status);
                     ui.add(
@@ -354,7 +348,46 @@ fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.end_row();
                 }
             });
+        ui.label("提示：按住 Ctrl 点击可多选任务，双击可开始或取消");
     });
+}
+
+/// 右键菜单：针对右键行，或在多选时作用于全部选中任务。
+fn context_menu(ui: &mut egui::Ui, state: &mut AppState, task: &TaskSnapshot) {
+    if ui.button("开始").clicked() {
+        state.start_task(task.id);
+        ui.close_menu();
+    }
+    if ui.button("取消").clicked() {
+        state.cancel_task(task.id);
+        ui.close_menu();
+    }
+    if ui.button("编辑").clicked() {
+        state.edit_task = Some(EditTask {
+            id: task.id,
+            source_url: task.source_url.clone(),
+            output_name: task.output_name.clone(),
+            output_directory: task.output_directory.clone(),
+            request_headers: task.request_headers.clone(),
+        });
+        ui.close_menu();
+    }
+    if ui.button("重试").clicked() {
+        state.retry_task(task.id);
+        ui.close_menu();
+    }
+    if ui.button("删除").clicked() {
+        state.delete_task(task.id);
+        ui.close_menu();
+    }
+    if ui.button("复制链接").clicked() {
+        ui.output_mut(|writer| writer.copied_text = task.source_url.clone());
+        ui.close_menu();
+    }
+    if ui.button("打开目录").clicked() {
+        state.open_task_directory(task);
+        ui.close_menu();
+    }
 }
 
 fn status_label(ui: &mut egui::Ui, status: TaskStatus) {
@@ -615,9 +648,31 @@ fn render_edit_window(ctx: &egui::Context, state: &mut AppState) {
                 egui::TextEdit::singleline(&mut edit.source_url)
                     .desired_width(ui.available_width()),
             );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("保存路径");
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit.output_directory)
+                        .desired_width(ui.available_width() - 70.0),
+                );
+                if ui.button("选择").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        edit.output_directory = path.to_string_lossy().into_owned();
+                    }
+                }
+            });
+            ui.add_space(4.0);
             ui.label("文件名");
             ui.add(
                 egui::TextEdit::singleline(&mut edit.output_name)
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(4.0);
+            ui.label("请求头 JSON");
+            ui.add(
+                egui::TextEdit::multiline(&mut edit.request_headers)
+                    .hint_text(r#"{"Referer":"https://example.com"}"#)
+                    .desired_rows(2)
                     .desired_width(ui.available_width()),
             );
             ui.add_space(8.0);

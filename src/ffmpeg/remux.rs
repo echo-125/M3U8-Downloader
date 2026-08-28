@@ -30,6 +30,26 @@ pub async fn run_version_check(program: &str) -> Result<(), FfmpegError> {
     }
 }
 
+/// fMP4 直接拼接的产物缺少索引，重封装一次并把 moov 前置，便于边下边播。
+pub async fn remux_faststart(
+    program: &str,
+    input: &Path,
+    output: &Path,
+) -> Result<PathBuf, FfmpegError> {
+    if output.exists() {
+        return Err(FfmpegError::Execution("输出文件已存在".into()));
+    }
+    let arguments = copy_arguments(input, output, true);
+    let output_result = run_command(program, &arguments, Some(FFMPEG_TIMEOUT)).await?;
+    if output_result.status.success() && output.is_file() {
+        return Ok(output.to_path_buf());
+    }
+    let _ = tokio::fs::remove_file(output).await;
+    Err(FfmpegError::Conversion(last_error_lines(
+        &output_result.stderr,
+    )))
+}
+
 pub async fn remux_to_mp4(
     program: &str,
     input: &Path,
@@ -39,42 +59,14 @@ pub async fn remux_to_mp4(
         return Err(FfmpegError::Execution("输出文件已存在".into()));
     }
 
-    let input_text = input.to_string_lossy().into_owned();
-    let output_text = output.to_string_lossy().into_owned();
-    let copy_arguments = vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-i".to_string(),
-        input_text,
-        "-c".to_string(),
-        "copy".to_string(),
-        "-y".to_string(),
-        output_text,
-    ];
+    let copy_arguments = copy_arguments(input, output, false);
     let output_result = run_command(program, &copy_arguments, Some(FFMPEG_TIMEOUT)).await?;
     if output_result.status.success() && output.is_file() {
         return Ok(output.to_path_buf());
     }
     let _ = tokio::fs::remove_file(output).await;
 
-    let input_text = input.to_string_lossy().into_owned();
-    let output_text = output.to_string_lossy().into_owned();
-    let encode_arguments = vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-i".to_string(),
-        input_text,
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        "fast".to_string(),
-        "-c:a".to_string(),
-        "aac".to_string(),
-        "-y".to_string(),
-        output_text,
-    ];
+    let encode_arguments = encode_arguments(input, output);
     let output_result = run_command(program, &encode_arguments, Some(FFMPEG_TIMEOUT)).await?;
     if output_result.status.success() && output.is_file() {
         return Ok(output.to_path_buf());
@@ -83,6 +75,37 @@ pub async fn remux_to_mp4(
     Err(FfmpegError::Conversion(last_error_lines(
         &output_result.stderr,
     )))
+}
+
+fn copy_arguments(input: &Path, output: &Path, faststart: bool) -> Vec<String> {
+    build_arguments(input, output, &["-c", "copy"], faststart)
+}
+
+fn encode_arguments(input: &Path, output: &Path) -> Vec<String> {
+    build_arguments(
+        input,
+        output,
+        &["-c:v", "libx264", "-preset", "fast", "-c:a", "aac"],
+        false,
+    )
+}
+
+fn build_arguments(input: &Path, output: &Path, codec: &[&str], faststart: bool) -> Vec<String> {
+    let mut arguments = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        input.to_string_lossy().into_owned(),
+    ];
+    arguments.extend(codec.iter().map(|value| value.to_string()));
+    if faststart {
+        arguments.push("-movflags".to_string());
+        arguments.push("faststart".to_string());
+    }
+    arguments.push("-y".to_string());
+    arguments.push(output.to_string_lossy().into_owned());
+    arguments
 }
 
 async fn run_command(
