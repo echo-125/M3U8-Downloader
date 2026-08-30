@@ -19,3 +19,6 @@ desktop.ini
 
 # AI 协作规范（不纳入版本控制）
 AGENTS.md
+
+# WorkBuddy 记忆目录（本地协作记忆，不纳入版本控制）
+.workbuddy/
