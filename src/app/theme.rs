@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::config::ThemeKind;
+use crate::core::events::TaskStatus;
 use eframe::egui;
 
 const CJK_FONT_FILES: &[&str] = &[
@@ -51,20 +52,61 @@ impl Palette {
     }
 }
 
-/// 按钮上只写目标主题，名称保持简短。
-pub fn switch_label(theme: ThemeKind) -> &'static str {
-    match theme {
-        ThemeKind::Light => "暗色",
-        ThemeKind::Dark => "亮色",
+/// 强调色：主按钮填充、选中 tab 下划线、超链接、选中行背景都用它。
+/// 不要直接读 `visuals.selection.bg_fill`——那只是「文本选中高亮」的背景，
+/// 浅色主题下必须是浅色（深色文字才能看清），与强调色语义不同。
+pub fn accent_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(76, 154, 255)
+    } else {
+        egui::Color32::from_rgb(37, 118, 214)
     }
 }
 
-/// 悬停时补足完整说明，避免只看到「暗色」两个字不清楚是切换还是当前状态。
+/// 悬停时补足完整说明：图标按钮只有图形没有文字，
+/// 不提示的话用户不知道点它会发生什么。
 pub fn switch_hint(theme: ThemeKind) -> &'static str {
     match theme {
         ThemeKind::Light => "切换到暗色主题",
         ThemeKind::Dark => "切换到亮色主题",
     }
+}
+
+/// 任务状态的文字颜色，亮暗主题分别取值。
+///
+/// 旧实现把颜色硬编码在业务代码里，且亮色下黄 2.3:1、橙 2.9:1、绿 3.2:1，
+/// 全都不达 WCAG 4.5:1，暗色下的蓝也只有约 3.4:1。这里统一按主题校准：
+/// 亮色对白卡片底、暗色对卡片底 (36,40,48)，全部 ≥ 4.6:1。
+pub fn status_color(dark_mode: bool, status: TaskStatus) -> egui::Color32 {
+    if dark_mode {
+        match status {
+            TaskStatus::Waiting => egui::Color32::from_rgb(139, 148, 158),
+            TaskStatus::Downloading => egui::Color32::from_rgb(108, 178, 255),
+            TaskStatus::Canceling => egui::Color32::from_rgb(227, 179, 65),
+            TaskStatus::Completed => egui::Color32::from_rgb(87, 217, 119),
+            TaskStatus::Failed => egui::Color32::from_rgb(255, 123, 114),
+            TaskStatus::Canceled => egui::Color32::from_rgb(240, 136, 62),
+        }
+    } else {
+        match status {
+            TaskStatus::Waiting => egui::Color32::from_rgb(108, 117, 125),
+            TaskStatus::Downloading => egui::Color32::from_rgb(48, 122, 216),
+            TaskStatus::Canceling => egui::Color32::from_rgb(154, 103, 0),
+            TaskStatus::Completed => egui::Color32::from_rgb(21, 115, 71),
+            TaskStatus::Failed => egui::Color32::from_rgb(214, 69, 65),
+            TaskStatus::Canceled => egui::Color32::from_rgb(180, 83, 9),
+        }
+    }
+}
+
+/// 警告类提示文字的颜色（ffmpeg 未检测到、取消中这一类），两种主题下都达标。
+pub fn warning_color(dark_mode: bool) -> egui::Color32 {
+    status_color(dark_mode, TaskStatus::Canceling)
+}
+
+/// 成功类提示文字的颜色（ffmpeg 检测到、已完成这一类），两种主题下都达标。
+pub fn success_color(dark_mode: bool) -> egui::Color32 {
+    status_color(dark_mode, TaskStatus::Completed)
 }
 
 pub fn install_fonts(ctx: &egui::Context) -> Option<String> {
@@ -142,10 +184,10 @@ pub fn apply(ctx: &egui::Context, theme: ThemeKind) {
     visuals.faint_bg_color = palette.faint;
     visuals.window_rounding = egui::Rounding::same(10.0);
     visuals.menu_rounding = egui::Rounding::same(8.0);
-    visuals.selection.bg_fill = palette.accent;
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    // selection 恢复 egui 默认（浅色=淡蓝底、暗色=深蓝底）：egui 绘制文本选中时
+    // 不改变文字颜色，只垫背景矩形。若把背景设成深蓝强调色，浅色主题下的深色文字
+    // 落在深蓝底上就看不清选中了哪些字。强调色请用 accent_color()，见其注释。
     visuals.hyperlink_color = palette.accent;
-
     let widgets = &mut visuals.widgets;
     for state in [
         &mut widgets.noninteractive,
@@ -161,8 +203,10 @@ pub fn apply(ctx: &egui::Context, theme: ThemeKind) {
     widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette.border);
     widgets.hovered.bg_fill = palette.widget_hover;
     widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette.accent);
-    widgets.active.bg_fill = palette.accent;
-    widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    // active 态保留 egui 默认（浅色=深字、暗色=白字）：这里一旦改成「强调色底+白字」，
+    // strong 文本会跟着变白——egui 的 strong_text_color() 直接取 active 的文字色，
+    // 浅色主题下「运行日志」、选中 tab、表头、设置分组标题全部会看不清。
+    // 需要强调色背景的按钮（主按钮/危险按钮）都显式设置了 fill 与文字色，不依赖这里。
 
     ctx.set_style(style);
 }

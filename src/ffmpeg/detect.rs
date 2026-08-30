@@ -1,20 +1,33 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Settings;
+use crate::ffmpeg::FfmpegInfo;
 
-pub async fn detect_ffmpeg(settings: &Settings) -> Option<String> {
+/// 检测可用 ffmpeg，返回其路径与版本号；找不到返回 None。
+pub async fn detect_ffmpeg(settings: &Settings) -> Option<FfmpegInfo> {
     if !settings.ffmpeg.auto_detect && !settings.ffmpeg.manual_path.trim().is_empty() {
         let path = settings.ffmpeg.manual_path.trim();
-        return verify_ffmpeg(path).await.then(|| path.to_string());
+        return verify_ffmpeg(path).await.map(|version| FfmpegInfo {
+            path: path.to_string(),
+            version,
+        });
     }
 
     let manual_path = settings.ffmpeg.manual_path.trim();
-    if !manual_path.is_empty() && verify_ffmpeg(manual_path).await {
-        return Some(manual_path.to_string());
+    if !manual_path.is_empty() {
+        if let Some(version) = verify_ffmpeg(manual_path).await {
+            return Some(FfmpegInfo {
+                path: manual_path.to_string(),
+                version,
+            });
+        }
     }
-    if settings.ffmpeg.auto_detect && verify_ffmpeg("ffmpeg").await {
-        // 解析出 PATH 里的完整路径，设置页才能显示本地位置而不是裸命令名。
-        return Some(find_in_path("ffmpeg").unwrap_or_else(|| "ffmpeg".to_string()));
+    if settings.ffmpeg.auto_detect {
+        if let Some(version) = verify_ffmpeg("ffmpeg").await {
+            // 解析出 PATH 里的完整路径，设置页才能显示本地位置而不是裸命令名。
+            let path = find_in_path("ffmpeg").unwrap_or_else(|| "ffmpeg".to_string());
+            return Some(FfmpegInfo { path, version });
+        }
     }
     None
 }
@@ -40,11 +53,9 @@ fn find_in_path(program: &str) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-async fn verify_ffmpeg(program: &str) -> bool {
+async fn verify_ffmpeg(program: &str) -> Option<String> {
     if program != "ffmpeg" && !Path::new(program).is_file() {
-        return false;
+        return None;
     }
-    crate::ffmpeg::remux::run_version_check(program)
-        .await
-        .is_ok()
+    crate::ffmpeg::remux::run_version(program).await.ok()
 }

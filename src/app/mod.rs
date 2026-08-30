@@ -18,6 +18,7 @@ use std::time::Instant;
 use eframe::egui::{self, ViewportCommand};
 
 use crate::config::{Settings, ThemeKind};
+use crate::core::events::TaskStatus;
 
 pub struct CatCatchApp {
     state: AppState,
@@ -26,6 +27,8 @@ pub struct CatCatchApp {
     last_window_size_saved: Instant,
     /// 已应用到 egui 的主题。样式只在主题变化时重建，避免每帧失效文本布局缓存。
     applied_theme: Option<ThemeKind>,
+    /// 上一帧是否有进行中任务，用于检测「全部结束」的瞬间。
+    had_active_tasks: bool,
 }
 
 impl CatCatchApp {
@@ -51,7 +54,36 @@ impl CatCatchApp {
             window_size_dirty: false,
             last_window_size_saved: Instant::now(),
             applied_theme: None,
+            had_active_tasks: false,
         }
+    }
+
+    /// 全部任务从「有进行中」转为「全结束」的瞬间给一次汇总反馈。
+    /// 用户常常把窗口缩到托盘等下载完，此刻若窗口最小化就恢复置前，否则提醒白给了。
+    fn notify_all_finished(&mut self, ctx: &egui::Context) {
+        let has_active = self.state.active_task_count() > 0;
+        if self.had_active_tasks && !has_active {
+            let completed = self
+                .state
+                .tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Completed)
+                .count();
+            let failed = self
+                .state
+                .tasks
+                .iter()
+                .filter(|task| task.status == TaskStatus::Failed)
+                .count();
+            self.state.show_toast(
+                format!("全部任务结束：{completed} 个成功，{failed} 个失败"),
+                failed > 0,
+            );
+            if ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+                self.restore_window(ctx);
+            }
+        }
+        self.had_active_tasks = has_active;
     }
 
     /// 把窗口从最小化 / 后台状态带到用户面前。
@@ -85,6 +117,7 @@ impl eframe::App for CatCatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.process_events();
         self.state.expire_toast();
+        self.notify_all_finished(ctx);
         let theme = self.state.settings.appearance.theme;
         if self.applied_theme != Some(theme) {
             apply(ctx, theme);
@@ -95,7 +128,8 @@ impl eframe::App for CatCatchApp {
         self.handle_close_request(ctx);
         self.sync_window_size(ctx);
         // 只在有任务在跑或有 Toast 需要消失时高频重绘，空闲时降低到 1 秒一次。
-        let idle = self.state.active_task_count() == 0 && self.state.toast.is_none();
+        // 常驻的错误 Toast 不算——它不倒计时，没必要拖着重绘频率不放。
+        let idle = self.state.active_task_count() == 0 && !self.state.has_expiring_toast();
         let interval = if idle { 1000 } else { 200 };
         ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }

@@ -6,7 +6,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{error::CoreError, merge::sanitize_filename, playlist::MediaPlaylist};
+use crate::core::{
+    error::CoreError,
+    merge::{safe_remove_directory, sanitize_filename},
+    playlist::MediaPlaylist,
+};
 
 pub const TASK_DIRECTORY_NAME: &str = ".cat-catch-tasks";
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -134,6 +138,20 @@ impl TaskManifest {
     /// 标记任务已被用户清除，避免重启后重新载入。
     pub fn mark_dismissed(&mut self) -> Result<(), CoreError> {
         self.dismissed = true;
+        self.save()
+    }
+
+    /// 清空已下载的分片并恢复待下载状态，用于「取消后重新开始」。
+    ///
+    /// 删掉目录后必须重建：manifest 本身就存在这个目录里，只删不建会让随后的
+    /// save 落空，任务在内存里是「等待中」、磁盘上却已消失，重启时扫描不到。
+    /// 目录被外部提前删掉也能自愈——safe_remove_directory 对不存在的目录返回成功。
+    pub fn reset_for_redownload(&mut self) -> Result<(), CoreError> {
+        safe_remove_directory(&self.task_directory())?;
+        fs::create_dir_all(self.task_directory())
+            .map_err(|_| CoreError::Io("重建任务临时目录失败".into()))?;
+        self.completed = false;
+        self.output_path = None;
         self.save()
     }
 }

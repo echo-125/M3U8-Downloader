@@ -169,8 +169,8 @@ async fn manager_loop(
             TaskCommand::UpdateSettings(new_settings) => update_settings(&state, new_settings),
             TaskCommand::DetectFfmpeg => {
                 let settings = read_settings(&state.settings);
-                let path = crate::ffmpeg::detect_ffmpeg(&settings).await;
-                let _ = state.event_sender.send(TaskEvent::FfmpegStatus { path });
+                let info = crate::ffmpeg::detect_ffmpeg(&settings).await;
+                let _ = state.event_sender.send(TaskEvent::FfmpegStatus { info });
             }
             TaskCommand::ScanMergeFolder { request_id, folder } => {
                 let result = scan_merge_folder(&folder)
@@ -521,19 +521,12 @@ fn reset_task(state: &ManagerState, id: u64) {
         }
         runtime.cancellation_token.cancel();
         runtime.handle.abort();
-        // 删除已下载的分片，重置后从头下载。
-        if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
+        // 清空已下载的分片，重置后从头下载。分片目录要重建，否则 manifest 无处落盘，
+        // 任务会停在内存里、重启后彻底消失。
+        if let Err(error) = runtime.manifest.reset_for_redownload() {
             let _ = state.event_sender.send(TaskEvent::Log {
-                level: CoreLogLevel::Warning,
-                message: format!("重置任务清理分片失败：{}", error.user_message()),
-            });
-        }
-        runtime.manifest.completed = false;
-        runtime.manifest.output_path = None;
-        if let Err(error) = runtime.manifest.save() {
-            let _ = state.event_sender.send(TaskEvent::Log {
-                level: CoreLogLevel::Warning,
-                message: format!("重置任务保存失败：{}", error.user_message()),
+                level: CoreLogLevel::Error,
+                message: format!("重置任务失败：{}", error.user_message()),
             });
         }
         Some((runtime.manifest.clone(), runtime.snapshot.clone()))
@@ -596,7 +589,7 @@ fn delete_task(state: &ManagerState, id: u64) {
         .lock()
         .ok()
         .and_then(|mut tasks| tasks.remove(&id));
-    let Some(runtime) = removed else {
+    let Some(mut runtime) = removed else {
         // 任务已不存在时也要通知界面移除对应行，否则会残留一个永远无法操作的幽灵任务。
         let _ = state
             .event_sender
@@ -605,7 +598,16 @@ fn delete_task(state: &ManagerState, id: u64) {
     };
     runtime.cancellation_token.cancel();
     runtime.handle.abort();
-    // 删除任务需要同时清理临时目录，否则重启后会被当作未完成任务重新载入。
+    // 先打 dismissed 标记再删目录。反过来做的话，一旦目录被占用删不掉，
+    // manifest 还在且没有标记，重启后任务会「死而复生」。
+    if !runtime.manifest.completed {
+        if let Err(error) = runtime.manifest.mark_dismissed() {
+            let _ = state.event_sender.send(TaskEvent::Log {
+                level: CoreLogLevel::Warning,
+                message: format!("标记已删除任务失败：{}", error.user_message()),
+            });
+        }
+    }
     if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
         let _ = state.event_sender.send(TaskEvent::Log {
             level: CoreLogLevel::Warning,
@@ -937,7 +939,9 @@ async fn merge_folder(
     let scan = scan_merge_folder(&folder)
         .await
         .map_err(|error| error.user_message())?;
-    let ffmpeg_program = crate::ffmpeg::detect_ffmpeg(&settings).await;
+    let ffmpeg_program = crate::ffmpeg::detect_ffmpeg(&settings)
+        .await
+        .map(|info| info.path);
     let (segments, initialization) =
         match (scan.ts_segments.is_empty(), scan.fmp4_segments.is_empty()) {
             (false, true) => (scan.ts_segments, None),

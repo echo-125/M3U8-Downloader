@@ -5,6 +5,8 @@
 
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 
+use super::theme;
+
 /// 表单左侧标签的固定宽度，保证各行输入框左缘对齐。
 pub const FORM_LABEL_WIDTH: f32 = 76.0;
 /// 表单控件高度，与按钮高度一致。
@@ -33,6 +35,14 @@ pub fn card<R>(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::U
     egui::Frame::default()
         .fill(ui.visuals().window_fill)
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        // 亮色下卡片是纯白、面板是浅灰，只靠 1px 淡描边几乎分不开边界；
+        // 一条轻投影把卡片从面板上托起来。
+        .shadow(egui::Shadow {
+            offset: egui::vec2(0.0, 1.0),
+            blur: 6.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(28),
+        })
         .rounding(8.0)
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, |ui| {
@@ -53,14 +63,14 @@ pub fn primary_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Res
         Color32::WHITE
     };
     let button = egui::Button::new(RichText::new(text).color(text_color))
-        .fill(ui.visuals().selection.bg_fill);
+        .fill(theme::accent_color(ui.visuals().dark_mode));
     ui.add_enabled(enabled, button)
 }
 
 /// 描边样式的次要按钮。与填充的主按钮并排时形成主次层级，
 /// 避免一行里出现两个同样抢眼的实心按钮。
 pub fn outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let accent = ui.visuals().selection.bg_fill;
+    let accent = theme::accent_color(ui.visuals().dark_mode);
     let response = ui.add(
         egui::Button::new(RichText::new(text).color(accent))
             .fill(Color32::TRANSPARENT)
@@ -84,6 +94,116 @@ pub fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         egui::Button::new(RichText::new(text).color(Color32::WHITE))
             .fill(Color32::from_rgb(214, 69, 65)),
     )
+}
+
+/// 强调色描边按钮：比普通按钮醒目，又不像实心主按钮那样抢眼，
+/// 用于「全部开始」这类次主操作，与工具栏里的主按钮形成层级。
+pub fn accent_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let accent = theme::accent_color(ui.visuals().dark_mode);
+    let button = egui::Button::new(RichText::new(text).color(accent))
+        .fill(Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0_f32, accent));
+    let response = ui.add_enabled(enabled, button);
+    // 显式 fill 会盖掉 Button 内置的悬停反馈，补一道更粗的描边提示可点。
+    if response.hovered() && response.enabled() {
+        ui.painter().rect_stroke(
+            response.rect,
+            ui.visuals().widgets.hovered.rounding,
+            egui::Stroke::new(2.0_f32, accent),
+        );
+    }
+    response
+}
+
+/// 自绘图标按钮：按当前交互状态画按钮背景，然后执行自定义绘制函数。
+///
+/// 用于主题切换、日志折叠这类只有图形没有文字的按钮。Unicode 符号在
+/// 中文环境里常被渲染成 emoji 或直接缺字，用 painter 画矢量最可靠。
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, &egui::style::WidgetVisuals),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter()
+            .rect(rect, visuals.rounding, visuals.bg_fill, visuals.bg_stroke);
+        paint(ui.painter(), rect, visuals);
+    }
+    response
+}
+
+/// 主题切换图标按钮。图标表示「点击后变成的样子」，与原先
+/// 「暗色 / 亮色」文字按钮语义一致：亮色下显示月亮，暗色下显示太阳。
+pub fn theme_switch_button(ui: &mut egui::Ui, theme: crate::config::ThemeKind) -> egui::Response {
+    let response = icon_button(ui, egui::vec2(34.0, 30.0), |painter, rect, visuals| {
+        let color = visuals.fg_stroke.color;
+        match theme {
+            crate::config::ThemeKind::Light => {
+                draw_moon(painter, rect.center(), color, visuals.bg_fill)
+            }
+            crate::config::ThemeKind::Dark => draw_sun(painter, rect.center(), color),
+        }
+    });
+    response.on_hover_text(super::theme::switch_hint(theme))
+}
+
+/// 折叠箭头按钮：展开时显示向下三角形，折叠时显示向右三角形。
+pub fn chevron_button(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+    icon_button(ui, egui::vec2(24.0, 22.0), |painter, rect, visuals| {
+        let color = visuals.fg_stroke.color;
+        let center = rect.center();
+        let half = 4.0;
+        let points = if expanded {
+            // 向下：▾
+            vec![
+                center + egui::vec2(-half, -half * 0.6),
+                center + egui::vec2(half, -half * 0.6),
+                center + egui::vec2(0.0, half * 0.9),
+            ]
+        } else {
+            // 向右：▸
+            vec![
+                center + egui::vec2(-half * 0.6, -half),
+                center + egui::vec2(-half * 0.6, half),
+                center + egui::vec2(half * 0.9, 0.0),
+            ]
+        };
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            color,
+            egui::Stroke::NONE,
+        ));
+    })
+}
+
+/// 太阳：中心圆 + 八条光芒线。
+fn draw_sun(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let radius = 5.5;
+    painter.circle_filled(center, radius, color);
+    for index in 0..8 {
+        let angle = index as f32 * std::f32::consts::TAU / 8.0;
+        let (sin, cos) = angle.sin_cos();
+        let direction = egui::vec2(cos, sin);
+        painter.line_segment(
+            [
+                center + direction * (radius + 2.0),
+                center + direction * (radius + 5.0),
+            ],
+            egui::Stroke::new(1.6_f32, color),
+        );
+    }
+}
+
+/// 月亮：主体圆靠左，用按钮背景色盖掉右上角形成月牙。
+/// 覆盖色必须等于按钮填充色，所以由调用方传入，不能直接取面板色。
+fn draw_moon(painter: &egui::Painter, center: egui::Pos2, color: Color32, background: Color32) {
+    let radius = 7.0;
+    let main = center + egui::vec2(-1.5, 0.0);
+    painter.circle_filled(main, radius, color);
+    let cut = main + egui::vec2(4.2, -2.0);
+    painter.circle_filled(cut, radius - 2.2, background);
 }
 
 /// 统一的单行输入框：内边距与按钮保持一致，避免各处高低不齐。
@@ -123,6 +243,9 @@ pub fn form_field_width(ui: &egui::Ui, trailing_button: bool) -> f32 {
     (ui.available_width() - reserved).max(160.0)
 }
 
+/// 错误提示用的红色，与状态列「已失败」保持一致。
+pub const ERROR_COLOR: Color32 = Color32::from_rgb(214, 69, 65);
+
 /// 表单行：固定宽度标签 + 撑满剩余空间的单行输入框，行尾可带一个按钮。
 /// 返回行尾按钮是否被点击。
 pub fn form_field(
@@ -132,16 +255,51 @@ pub fn form_field(
     hint: &str,
     button: Option<&str>,
 ) -> bool {
-    ui.horizontal(|ui| {
-        right_label(ui, label, FORM_LABEL_WIDTH);
-        let width = form_field_width(ui, button.is_some());
-        ui.add_sized([width, FORM_CONTROL_HEIGHT], input(text).hint_text(hint));
-        match button {
-            Some(label) => ui.button(label).clicked(),
-            None => false,
-        }
-    })
-    .inner
+    form_field_with_hint(ui, label, text, hint, button, None)
+}
+
+/// 与 `form_field` 相同，但 `error_hint` 非 `None` 时输入框描边变红，
+/// 并在输入框正下方显示原因，让用户在打字时就能看到问题，而不是点了提交才弹 Toast。
+pub fn form_field_with_hint(
+    ui: &mut egui::Ui,
+    label: &str,
+    text: &mut String,
+    hint: &str,
+    button: Option<&str>,
+    error_hint: Option<String>,
+) -> bool {
+    let clicked = ui
+        .horizontal(|ui| {
+            right_label(ui, label, FORM_LABEL_WIDTH);
+            let width = form_field_width(ui, button.is_some());
+            let response = ui.add_sized([width, FORM_CONTROL_HEIGHT], input(text).hint_text(hint));
+            if error_hint.is_some() {
+                // TextEdit 没有描边 builder，错误态参照 outline_button 的做法
+                // 在响应矩形上直接画。
+                ui.painter().rect_stroke(
+                    response.rect,
+                    ui.visuals().widgets.inactive.rounding,
+                    egui::Stroke::new(1.0_f32, ERROR_COLOR),
+                );
+            }
+            match button {
+                Some(label) => ui.button(label).clicked(),
+                None => false,
+            }
+        })
+        .inner;
+    if let Some(hint) = error_hint {
+        // 提示文字缩进到与输入框左缘对齐。
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 16.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.add_space(FORM_LABEL_WIDTH + ui.spacing().item_spacing.x);
+                ui.label(RichText::new(hint).small().color(ERROR_COLOR));
+            },
+        );
+    }
+    clicked
 }
 
 /// 表单行：固定宽度标签 + 撑满剩余空间的多行输入框。

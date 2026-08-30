@@ -20,14 +20,38 @@ pub enum FfmpegError {
     Conversion(String),
 }
 
-pub async fn run_version_check(program: &str) -> Result<(), FfmpegError> {
+/// 查询并解析 ffmpeg 版本号。
+///
+/// `ffmpeg -version` 第一行形如 `ffmpeg version 6.1.1-3ubuntu2 Copyright ...`，
+/// 取「ffmpeg version」之后的第一段作为版本号。个别构建输出 `ffmpeg version N-112234-g...`
+/// 或没有标准前缀，解析失败时回退返回整行内容，保证界面至少能看到个结果而不是空串。
+pub async fn run_version(program: &str) -> Result<String, FfmpegError> {
     let version_arguments = vec!["-version".to_string()];
     let output = run_command(program, &version_arguments, Some(FFMPEG_VERSION_TIMEOUT)).await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(FfmpegError::Execution("无法获取版本信息".into()))
+    if !output.status.success() {
+        return Err(FfmpegError::Execution("无法获取版本信息".into()));
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 正常构建版本信息在 stdout；个别静态构建会打进 stderr，两路都看。
+    let first_line = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    Ok(parse_version(first_line))
+}
+
+fn parse_version(first_line: &str) -> String {
+    let body = first_line
+        .strip_prefix("ffmpeg version")
+        .unwrap_or(first_line)
+        .trim_start();
+    body.split_whitespace()
+        .next()
+        .unwrap_or(first_line)
+        .to_string()
 }
 
 /// fMP4 直接拼接的产物缺少索引，重封装一次并把 moov 前置，便于边下边播。
@@ -220,6 +244,23 @@ fn last_error_lines(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_standard_version_line() {
+        assert_eq!(
+            parse_version(
+                "ffmpeg version 6.1.1-3ubuntu2 Copyright (c) 2000-2023 the FFmpeg developers"
+            ),
+            "6.1.1-3ubuntu2"
+        );
+    }
+
+    #[test]
+    fn parses_version_without_prefix() {
+        assert_eq!(parse_version("ffmpeg version 5.1"), "5.1");
+        // 非标准前缀按「第一段」兜底，至少不是空串。
+        assert_eq!(parse_version("N-112234-gabcdef"), "N-112234-gabcdef");
+    }
 
     #[test]
     fn escapes_windows_paths_in_concat_list() {

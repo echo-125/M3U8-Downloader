@@ -181,7 +181,9 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
         .iter()
         .map(|segment| manifest.segment_path(segment.index))
         .collect();
-    let ffmpeg_program = crate::ffmpeg::detect_ffmpeg(&settings).await;
+    let ffmpeg_program = crate::ffmpeg::detect_ffmpeg(&settings)
+        .await
+        .map(|info| info.path);
     // 没有 ffmpeg 时只能保留 TS，直接转换成 MP4 会在合并阶段失败。
     let initialization = manifest
         .playlist

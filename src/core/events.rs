@@ -138,7 +138,7 @@ pub enum TaskEvent {
         result: Result<crate::core::merge::MergeResult, String>,
     },
     FfmpegStatus {
-        path: Option<String>,
+        info: Option<crate::ffmpeg::FfmpegInfo>,
     },
 }
 

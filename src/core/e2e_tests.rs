@@ -27,7 +27,7 @@ use crate::{
     core::{
         downloader::{run_task, DownloadTask},
         events::{TaskEvent, TaskSnapshot, TaskStatus},
-        task::TaskManifest,
+        task::{discover_task_manifests, TaskManifest},
     },
 };
 
@@ -440,6 +440,78 @@ async fn fails_cleanly_when_playlist_is_missing() {
     assert!(result.is_err(), "播放列表 404 时任务应当失败而不是成功");
     // 失败后默认保留临时文件，便于用户排查。
     assert!(task_directory.is_dir(), "失败后应当保留任务临时目录");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn reset_keeps_manifest_for_resume() {
+    let directory = temp_dir("reset");
+    let mut manifest = TaskManifest::new(
+        1,
+        "http://127.0.0.1:1/v.m3u8",
+        "video",
+        &directory,
+        4,
+        HashMap::new(),
+    )
+    .expect("创建任务失败");
+    // 造出「已下载完成」的状态：分片落盘 + 标记为完成。
+    std::fs::write(manifest.segment_path(0), vec![0x47_u8; TS_PACKET_SIZE]).expect("写入分片失败");
+    manifest
+        .mark_completed(directory.join("video.ts"))
+        .expect("标记完成失败");
+
+    manifest.reset_for_redownload().expect("重置失败");
+
+    // 分片必须清掉，否则重新下载会拼进旧数据。
+    assert!(
+        !manifest.segment_path(0).exists(),
+        "重置后已下载的分片应当被删除"
+    );
+    assert!(!manifest.completed, "重置后不应再是已完成状态");
+    assert!(manifest.output_path.is_none(), "重置后应清空输出路径");
+    // 核心断言：manifest 存在任务目录里，目录被删又没重建的话这里就会失败，
+    // 任务在界面上还是「等待中」，重启后却彻底消失。
+    assert!(
+        manifest.manifest_path().is_file(),
+        "重置后 manifest 必须仍在磁盘上"
+    );
+    let reloaded = TaskManifest::load(&manifest.manifest_path()).expect("重新读取 manifest 失败");
+    assert_eq!(reloaded, manifest, "落盘内容应当与内存中的 manifest 一致");
+    assert!(
+        discover_task_manifests(&directory)
+            .iter()
+            .any(|found| found.id == manifest.id),
+        "重置后的任务必须能被启动扫描发现，否则断点续传会丢任务"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn reset_after_directory_removed_manually() {
+    let directory = temp_dir("reset-missing");
+    let mut manifest = TaskManifest::new(
+        2,
+        "http://127.0.0.1:1/v.m3u8",
+        "video",
+        &directory,
+        4,
+        HashMap::new(),
+    )
+    .expect("创建任务失败");
+    // 模拟任务目录被外部删掉（用户手动清理或磁盘工具回收）。
+    std::fs::remove_dir_all(manifest.task_directory()).expect("删除任务目录失败");
+
+    manifest
+        .reset_for_redownload()
+        .expect("目录不存在时重置应当自愈");
+
+    assert!(
+        manifest.manifest_path().is_file(),
+        "目录被外部删除后重置也要重新落盘"
+    );
 
     let _ = std::fs::remove_dir_all(&directory);
 }

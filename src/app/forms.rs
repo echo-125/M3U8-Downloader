@@ -3,24 +3,49 @@
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 
 use super::{
-    state::{AppState, CreationTab},
+    state::{url_validation_hint, AppState, CreationTab},
+    theme,
     widgets::{
-        card, form_field, form_field_multiline, number_input, outline_button, path_dialog_string,
-        primary_button, right_label, FORM_LABEL_WIDTH,
+        card, form_field, form_field_multiline, form_field_with_hint, number_input, outline_button,
+        path_dialog_string, primary_button, right_label, FORM_LABEL_WIDTH,
     },
 };
 
 pub fn render_creation_area(ui: &mut egui::Ui, state: &mut AppState) {
     card(ui, "新建任务", |ui| {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.creation_tab, CreationTab::Single, "单个任务");
-            ui.selectable_value(&mut state.creation_tab, CreationTab::Batch, "批量添加");
-            ui.selectable_value(
-                &mut state.creation_tab,
-                CreationTab::ManualMerge,
-                "手动合并",
-            );
+            let accent = theme::accent_color(ui.visuals().dark_mode);
+            for (tab, name) in [
+                (CreationTab::Single, "单个任务"),
+                (CreationTab::Batch, "批量添加"),
+                (CreationTab::ManualMerge, "手动合并"),
+            ] {
+                let selected = state.creation_tab == tab;
+                // 自绘标签页：selectable_value 的选中态是整块背景，看不出「页签」，
+                // 这里用强调色加粗 + 底部同色下划线表达选中，两种主题下对比度都达标。
+                let text = if selected {
+                    RichText::new(name).strong().color(accent)
+                } else {
+                    RichText::new(name).weak()
+                };
+                let response = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                if response.clicked() {
+                    state.creation_tab = tab;
+                }
+                if selected {
+                    let rect = response.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(rect.left(), rect.bottom() + 1.0),
+                            egui::vec2(rect.width(), 2.0),
+                        ),
+                        1.0,
+                        accent,
+                    );
+                }
+            }
         });
+        ui.add_space(2.0);
         ui.separator();
         match state.creation_tab {
             CreationTab::Single => render_single_task_form(ui, state),
@@ -31,12 +56,15 @@ pub fn render_creation_area(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_single_task_form(ui: &mut egui::Ui, state: &mut AppState) {
-    if form_field(
+    // 先算校验结果再借可变引用，两条借用不能同时存在。
+    let url_error = url_validation_hint(&state.single_url);
+    if form_field_with_hint(
         ui,
         "M3U8 链接",
         &mut state.single_url,
         "https://example.com/video.m3u8 或 链接|文件名|请求头JSON",
         Some("粘贴"),
+        url_error,
     ) {
         state.paste_from_clipboard();
     }
@@ -115,6 +143,8 @@ fn render_batch_task_form(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_manual_merge_form(ui: &mut egui::Ui, state: &mut AppState) {
+    // 路径一改，上一次扫描的结果就不再属于这个文件夹，作废掉让「开始合并」变灰。
+    state.invalidate_manual_scan_if_path_changed();
     let pick_folder = form_field(
         ui,
         "分片文件夹",

@@ -84,6 +84,9 @@ pub struct AppearanceConfig {
     pub theme: ThemeKind,
     pub window_width: f32,
     pub window_height: f32,
+    /// 底部日志面板是否展开。默认折叠，把竖向空间留给任务列表。
+    #[serde(default)]
+    pub log_panel_expanded: bool,
 }
 
 impl Default for AppearanceConfig {
@@ -92,6 +95,7 @@ impl Default for AppearanceConfig {
             theme: ThemeKind::Light,
             window_width: 960.0,
             window_height: 720.0,
+            log_panel_expanded: false,
         }
     }
 }
