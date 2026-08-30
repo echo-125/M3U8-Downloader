@@ -1,7 +1,11 @@
+pub mod dialogs;
+pub mod forms;
 pub mod layout;
 pub mod state;
+pub mod task_list;
 pub mod theme;
 pub mod tray;
+pub mod widgets;
 
 use self::{
     layout::render,
@@ -34,7 +38,7 @@ impl CatCatchApp {
         if let Some(warning) = install_fonts(&creation_context.egui_ctx) {
             state.logs.push_warning(warning);
         }
-        let tray = match TrayController::new() {
+        let tray = match TrayController::new(creation_context.egui_ctx.clone()) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 state.logs.push_warning(error);
@@ -50,15 +54,29 @@ impl CatCatchApp {
         }
     }
 
+    /// 把窗口从最小化 / 后台状态带到用户面前。
+    /// 只取消最小化不够：窗口可能还压在别的窗口背后，用户会以为点了没反应。
+    fn restore_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+    }
+
     fn request_exit(&mut self, ctx: &egui::Context) {
         if self.state.active_task_count() > 0 {
+            // 有任务在跑就先恢复窗口再弹确认框。
+            // 不能因为窗口缩在托盘里就静默结束进程——下载中的任务必须能拦住退出。
             self.state.request_exit_confirmation();
-            // 先恢复窗口再弹确认框：托盘退出时窗口可能处于最小化状态。
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            self.restore_window(ctx);
             return;
         }
         self.state.allow_exit = true;
+        // 最小化窗口收不到 Close 事件（winit 不给最小化窗口派发关闭事件），
+        // 走正常关闭流程会一直挂着。此时直接结束进程：任务状态随变化即时落盘，
+        // 文件日志逐行 flush，不丢数据。
+        if ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+            std::process::exit(0);
+        }
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 }
@@ -113,25 +131,20 @@ impl CatCatchApp {
 
 impl CatCatchApp {
     fn process_tray(&mut self, ctx: &egui::Context) {
-        let Some(action) = self.tray.as_ref().and_then(TrayController::poll) else {
+        let Some(tray) = self.tray.as_ref() else {
             return;
         };
-        match action {
-            TrayAction::Show => {
-                self.state.show_exit_confirmation = false;
-                // 最小化状态下恢复：先取消最小化再显示。
-                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            }
-            TrayAction::Exit => {
-                // 窗口最小化驻留托盘时，Close 命令对隐藏窗口不生效——帧循环虽在运行，
-                // winit 不会给最小化窗口派发关闭事件，走正常流程会一直挂着。
-                // 此时直接退出进程：任务状态随变化即时落盘，文件日志逐行 flush，不丢数据。
-                let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
-                if minimized {
-                    std::process::exit(0);
+        for action in tray.take_actions() {
+            match action {
+                TrayAction::Show => {
+                    self.state.show_exit_confirmation = false;
+                    self.restore_window(ctx);
                 }
-                self.request_exit(ctx);
+                TrayAction::Exit => {
+                    self.request_exit(ctx);
+                    // 退出请求已经发出，队列里剩下的动作没有意义了。
+                    return;
+                }
             }
         }
     }

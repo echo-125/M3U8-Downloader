@@ -31,7 +31,8 @@ impl TaskStatus {
     }
 
     /// 可以开始或重试的状态。
-    /// 已完成任务不在其中：核心启动已完成任务会重置 manifest，导致重新下载并覆盖已有成品。
+    /// 已完成任务不在其中：重新下载会覆盖已有成品（README 行为约定）。
+    /// 界面按此过滤操作入口，核心的 start_task 也以此为防线拒绝其余状态。
     pub fn is_startable(self) -> bool {
         matches!(self, Self::Waiting | Self::Failed | Self::Canceled)
     }

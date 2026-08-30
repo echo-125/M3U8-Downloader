@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod e2e_tests;
+
 pub mod decrypt;
 pub mod downloader;
 pub mod error;

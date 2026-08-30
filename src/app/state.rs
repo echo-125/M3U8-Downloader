@@ -459,10 +459,6 @@ impl AppState {
         self.manager.send(TaskCommand::Reset(vec![id]));
     }
 
-    pub fn is_task_selected(&self, id: u64) -> bool {
-        self.selected_task_ids.contains(&id)
-    }
-
     /// 点击行切换勾选状态，作为批量操作的选中集合。
     pub fn toggle_check(&mut self, id: u64) {
         match self
@@ -602,9 +598,14 @@ impl AppState {
     }
 
     pub fn open_task_directory(&mut self, snapshot: &TaskSnapshot) {
-        let path = snapshot
-            .output_path
-            .as_ref()
+        self.open_task_directory_paths(snapshot.output_path.as_deref(), &snapshot.output_directory);
+    }
+
+    /// 与 `open_task_directory` 相同，但接收已拷贝的字段：
+    /// 任务列表渲染持有任务快照的借用，需要在借用结束后改动 state，
+    /// 因此由调用方先把字段拷出来再传值进来。
+    pub fn open_task_directory_paths(&mut self, output_path: Option<&str>, output_directory: &str) {
+        let path = output_path
             .map(PathBuf::from)
             .map(|path| {
                 if path.is_file() {
@@ -613,7 +614,7 @@ impl AppState {
                     path
                 }
             })
-            .unwrap_or_else(|| PathBuf::from(&snapshot.output_directory));
+            .unwrap_or_else(|| PathBuf::from(output_directory));
         if !path.is_dir() {
             self.notify_error("目录不存在，无法打开");
             return;

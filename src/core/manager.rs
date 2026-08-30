@@ -451,7 +451,11 @@ fn start_task(state: &ManagerState, id: u64) {
         let Some(runtime) = tasks.get_mut(&id) else {
             return;
         };
-        if runtime.snapshot.status.is_active() {
+        // 只接受可开始的状态：下载中/取消中不能重复启动；已完成的任务禁止重新
+        // 开始——重下会重置 manifest 并覆盖已有成品（README 行为约定），界面已
+        // 按 is_startable 过滤，这里是核心侧防线。等待中的任务（包括
+        // auto_start=false 时 register_idle_task 登记的占位任务）由这里启动。
+        if !runtime.snapshot.status.is_startable() {
             return;
         }
         if runtime.manifest.completed {

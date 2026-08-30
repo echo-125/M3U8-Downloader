@@ -68,8 +68,7 @@ fn parse_master_playlist(content: &str, base: &Url) -> Result<Playlist, CoreErro
     let mut pending_bandwidth = None;
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if line.starts_with("#EXT-X-STREAM-INF:") {
-            let attributes = line.split_once(':').unwrap().1;
+        if let Some(attributes) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             pending_bandwidth = Some(
                 unquoted_attribute(attributes, "BANDWIDTH")
                     .and_then(|value| value.parse::<u64>().ok())
@@ -110,10 +109,10 @@ fn parse_media_playlist(content: &str, base: &Url) -> Result<Playlist, CoreError
         if !line.starts_with('#') {
             let url = base.join(line).map_err(|_| CoreError::InvalidUrl)?;
             let byte_range = pending_byte_range.take().map(|mut range| {
-                if range.offset.is_none() {
-                    range.offset = Some(next_implicit_offset);
-                }
-                next_implicit_offset = range.offset.unwrap() + range.length;
+                // 隐式 BYTERANGE：偏移量取自上一个分片结束位置。
+                let offset = range.offset.unwrap_or(next_implicit_offset);
+                range.offset = Some(offset);
+                next_implicit_offset = offset + range.length;
                 range
             });
             let index = segments.len();
@@ -126,16 +125,12 @@ fn parse_media_playlist(content: &str, base: &Url) -> Result<Playlist, CoreError
             continue;
         }
 
-        if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
-            media_sequence = line
-                .split_once(':')
-                .unwrap()
-                .1
+        if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = value
                 .trim()
                 .parse()
                 .map_err(|_| CoreError::InvalidPlaylist)?;
-        } else if line.starts_with("#EXT-X-MAP:") {
-            let attributes = line.split_once(':').unwrap().1;
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
             let uri = quoted_attribute(attributes, "URI").ok_or(CoreError::InvalidPlaylist)?;
             let url = base.join(&uri).map_err(|_| CoreError::InvalidUrl)?;
             let byte_range = parse_byte_range_attribute(attributes)?;
@@ -143,12 +138,10 @@ fn parse_media_playlist(content: &str, base: &Url) -> Result<Playlist, CoreError
                 url: url.to_string(),
                 byte_range,
             });
-        } else if line.starts_with("#EXT-X-KEY:") {
-            let attributes = line.split_once(':').unwrap().1;
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-KEY:") {
             current_encryption = parse_key(attributes, base)?;
-        } else if line.starts_with("#EXT-X-BYTERANGE:") {
-            let value = line.split_once(':').unwrap().1.trim();
-            pending_byte_range = Some(parse_byte_range_value(value)?);
+        } else if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            pending_byte_range = Some(parse_byte_range_value(value.trim())?);
         }
     }
 
@@ -194,8 +187,8 @@ fn parse_iv(value: &str) -> Result<[u8; 16], CoreError> {
     }
     let mut iv = [0_u8; 16];
     for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
-        let text = std::str::from_utf8(chunk).unwrap();
-        iv[index] = u8::from_str_radix(text, 16).unwrap();
+        let text = std::str::from_utf8(chunk).map_err(|_| CoreError::InvalidPlaylist)?;
+        iv[index] = u8::from_str_radix(text, 16).map_err(|_| CoreError::InvalidPlaylist)?;
     }
     Ok(iv)
 }
@@ -310,6 +303,57 @@ mod tests {
             panic!("必须是媒体播放列表");
         };
         assert!(!media.has_end_list);
+    }
+
+    #[test]
+    fn continues_implicit_byte_range_offsets() {
+        // BYTERANGE 省略 @offset 时，偏移延续上一个分片的结束位置继续累加；
+        // 显式给出 @offset 时直接使用，并重置后续的隐式偏移基准。
+        let content = "#EXTM3U\n#EXT-X-BYTERANGE:1000\nseg1.ts\n#EXT-X-BYTERANGE:2000\nseg2.ts\n#EXT-X-BYTERANGE:500@10000\nseg3.ts\n#EXT-X-ENDLIST\n";
+        let playlist = parse_playlist(content, BASE).unwrap();
+        let Playlist::Media(media) = playlist else {
+            panic!("必须是媒体播放列表");
+        };
+        assert_eq!(
+            media.segments[0].byte_range,
+            Some(ByteRange {
+                length: 1000,
+                offset: Some(0)
+            })
+        );
+        assert_eq!(
+            media.segments[1].byte_range,
+            Some(ByteRange {
+                length: 2000,
+                offset: Some(1000)
+            })
+        );
+        assert_eq!(
+            media.segments[2].byte_range,
+            Some(ByteRange {
+                length: 500,
+                offset: Some(10000)
+            })
+        );
+    }
+
+    #[test]
+    fn byte_range_only_applies_to_next_segment() {
+        // 一个 BYTERANGE 标签只描述紧随其后的那一个分片，
+        // 没有新标签的后续分片不继承 byte_range（HLS 规范行为）。
+        let content = "#EXTM3U\n#EXT-X-BYTERANGE:1000@0\nseg1.ts\nseg2.ts\n#EXT-X-ENDLIST\n";
+        let playlist = parse_playlist(content, BASE).unwrap();
+        let Playlist::Media(media) = playlist else {
+            panic!("必须是媒体播放列表");
+        };
+        assert_eq!(
+            media.segments[0].byte_range,
+            Some(ByteRange {
+                length: 1000,
+                offset: Some(0)
+            })
+        );
+        assert_eq!(media.segments[1].byte_range, None);
     }
 
     #[test]

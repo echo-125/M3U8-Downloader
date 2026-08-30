@@ -17,6 +17,5 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# 项目文档（不纳入版本控制）
+# AI 协作规范（不纳入版本控制）
 AGENTS.md
-DEVELOPMENT_PLAN.md
