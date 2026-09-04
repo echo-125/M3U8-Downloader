@@ -374,6 +374,7 @@ pub fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(300.0)
         .show(ctx, |ui| {
             ui.label("确定要清空任务列表吗？将移除所有已结束的任务。");
             ui.add_space(12.0);

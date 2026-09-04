@@ -149,22 +149,15 @@ impl Default for Settings {
     }
 }
 
+/// 配置文件路径：始终放在可执行文件同目录。
+/// 不再降级到 %APPDATA%——便携版单 exe 的配置应与程序在一起，便于迁移和备份。
+/// current_exe 取不到时回退到当前目录，避免 panic。
 pub fn default_config_path() -> PathBuf {
-    let executable_directory = std::env::current_exe()
+    let directory = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-
-    if let Some(directory) = executable_directory {
-        let path = directory.join("config.json");
-        if directory_is_writable(&directory) {
-            return path;
-        }
-    }
-
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("cat-catch-assistant")
-        .join("config.json")
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    directory.join("config.json")
 }
 
 fn default_download_path() -> String {
@@ -175,18 +168,10 @@ fn default_download_path() -> String {
         .into_owned()
 }
 
-fn directory_is_writable(directory: &Path) -> bool {
-    let probe = directory.join(".cat-catch-write-test");
-    let writable = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&probe)
-        .is_ok();
-    let _ = fs::remove_file(probe);
-    writable
-}
-
 impl Settings {
+    /// 读取配置：文件不存在时创建默认配置并写盘；读取/解析失败时重写为默认配置。
+    /// 不再区分「解析失败」与「读取失败」的警告文案——统一重写为默认配置，
+    /// 避免用户被旧配置文件卡住（例如从旧版本迁移时字段类型不兼容）。
     pub fn load_or_default(path: Option<&Path>) -> (Self, Option<String>) {
         let owned_path = path
             .map(Path::to_path_buf)
@@ -201,25 +186,29 @@ impl Settings {
             return (settings, warning);
         }
 
-        match fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<Self>(&content) {
-                Ok(mut settings) => match settings.validate() {
-                    Ok(()) => (settings, None),
-                    Err(error) => (
-                        Self::default(),
-                        Some(format!("配置无效，已使用默认设置：{error}")),
-                    ),
-                },
-                Err(_) => (
-                    Self::default(),
-                    Some("配置文件格式无效，已使用默认设置".to_string()),
-                ),
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => return Self::regenerate_default(path),
+        };
+
+        match serde_json::from_str::<Self>(&content) {
+            Ok(mut settings) => match settings.validate() {
+                Ok(()) => (settings, None),
+                Err(_) => Self::regenerate_default(path),
             },
-            Err(_) => (
-                Self::default(),
-                Some("配置文件读取失败，已使用默认设置".to_string()),
-            ),
+            Err(_) => Self::regenerate_default(path),
         }
+    }
+
+    /// 把无效配置替换为默认配置并写盘。
+    /// 重写成功则返回 None（静默替换，用户无感知）；重写失败才给警告。
+    fn regenerate_default(path: &Path) -> (Self, Option<String>) {
+        let settings = Self::default();
+        let warning = settings
+            .save(Some(path))
+            .err()
+            .map(|_| "配置文件无效，已重置为默认设置".to_string());
+        (settings, warning)
     }
 
     pub fn save(&self, path: Option<&Path>) -> Result<(), ConfigError> {
@@ -335,6 +324,47 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let loaded: Settings = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.max_workers, 8);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn load_creates_default_when_missing() {
+        let directory = tempfile_directory();
+        let path = directory.join("config.json");
+        assert!(!path.exists());
+        let (settings, warning) = Settings::load_or_default(Some(&path));
+        assert!(warning.is_none());
+        assert!(path.exists());
+        assert_eq!(settings, Settings::default());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn load_replaces_invalid_json_with_default() {
+        let directory = tempfile_directory();
+        let path = directory.join("config.json");
+        fs::write(&path, "not-json").unwrap();
+        let (settings, warning) = Settings::load_or_default(Some(&path));
+        assert!(warning.is_none());
+        assert_eq!(settings, Settings::default());
+        let content = fs::read_to_string(&path).unwrap();
+        let _: Settings = serde_json::from_str(&content).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn load_replaces_invalid_values_with_default() {
+        let directory = tempfile_directory();
+        let path = directory.join("config.json");
+        let settings = Settings {
+            max_workers: 0,
+            ..Settings::default()
+        };
+        let content = serde_json::to_string_pretty(&settings).unwrap();
+        fs::write(&path, content).unwrap();
+        let (settings, warning) = Settings::load_or_default(Some(&path));
+        assert!(warning.is_none());
+        assert_eq!(settings, Settings::default());
         fs::remove_dir_all(directory).unwrap();
     }
 

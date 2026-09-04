@@ -318,6 +318,35 @@ pub fn form_field_multiline(
     });
 }
 
+/// 只读展示表单行：固定宽度标签 + 撑满剩余空间的只读输入框，行尾可带一个按钮。
+///
+/// 保存路径只存在于设置一处，主界面只展示；修改入口只有「选择」按钮
+/// （会改设置并落盘）。禁用手输是为了杜绝「界面显示 A、任务存到 B」的双路径状态。
+/// 返回行尾按钮是否被点击。
+pub fn readonly_form_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    text: &str,
+    button: Option<&str>,
+) -> bool {
+    let mut displayed = text.to_string();
+    ui.horizontal(|ui| {
+        right_label(ui, label, FORM_LABEL_WIDTH);
+        let width = form_field_width(ui, button.is_some());
+        ui.add_sized(
+            [width, FORM_CONTROL_HEIGHT],
+            egui::TextEdit::singleline(&mut displayed)
+                .interactive(false)
+                .margin(egui::Margin::symmetric(8.0, 5.0)),
+        );
+        match button {
+            Some(label) => ui.button(label).clicked(),
+            None => false,
+        }
+    })
+    .inner
+}
+
 /// 固定高度的竖直分隔线，用于水平排列的工具栏。
 ///
 /// 不能直接调 `ui.separator()`：它在水平布局中把高度取成当前可用高度

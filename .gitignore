@@ -22,3 +22,8 @@ AGENTS.md
 
 # WorkBuddy 记忆目录（本地协作记忆，不纳入版本控制）
 .workbuddy/
+
+# 其他本地文件夹
+.zcode/
+diagrams/
+graphify-out/

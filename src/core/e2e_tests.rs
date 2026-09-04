@@ -27,6 +27,7 @@ use crate::{
     core::{
         downloader::{run_task, DownloadTask},
         events::{TaskEvent, TaskSnapshot, TaskStatus},
+        merge::merge_segments,
         task::{discover_task_manifests, TaskManifest},
     },
 };
@@ -258,6 +259,178 @@ async fn downloads_and_merges_ts_playlist() {
         previous = value.progress;
     }
     assert!((previous - 1.0).abs() < f32::EPSILON, "最终进度应为 100%");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 两个同名任务并发下载到同一目录时，中间文件必须不互相覆盖，
+/// 否则会出现「文件名不同、内容却相同」的现象。
+#[tokio::test]
+async fn concurrent_same_name_tasks_produce_distinct_outputs() {
+    let directory = temp_dir("concurrent");
+    // 两个任务用不同填充值，合并后内容必然不同——这正是断言依据。
+    let segments_a: Vec<Vec<u8>> = (0..2).map(|_| ts_segment(6, 0x11)).collect();
+    let segments_b: Vec<Vec<u8>> = (0..2).map(|_| ts_segment(6, 0x22)).collect();
+
+    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    for (index, data) in segments_a.iter().enumerate() {
+        routes.insert(format!("/a/seg{index}.ts"), data.clone());
+    }
+    for (index, data) in segments_b.iter().enumerate() {
+        routes.insert(format!("/b/seg{index}.ts"), data.clone());
+    }
+    routes.insert(
+        "/a.m3u8".to_string(),
+        media_playlist("/a", 2, None).into_bytes(),
+    );
+    routes.insert(
+        "/b.m3u8".to_string(),
+        media_playlist("/b", 2, None).into_bytes(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let url_a = server.url("/a.m3u8");
+    let url_b = server.url("/b.m3u8");
+    let settings = test_settings();
+    let dir = directory.clone();
+
+    // 两个任务都用同一个名字，故意制造并发合并撞名的条件。
+    let task_a = tokio::spawn(async move {
+        let manifest =
+            TaskManifest::new(1, &url_a, "video", &dir, 4, HashMap::new()).expect("创建任务失败");
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        run_task(DownloadTask {
+            manifest,
+            settings,
+            event_sender: sender,
+            cancellation_token: CancellationToken::new(),
+            global_permits: Arc::new(Semaphore::new(8)),
+        })
+        .await
+        .expect("任务 A 失败")
+    });
+    let dir = directory.clone();
+    let task_b = tokio::spawn(async move {
+        let manifest =
+            TaskManifest::new(2, &url_b, "video", &dir, 4, HashMap::new()).expect("创建任务失败");
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        run_task(DownloadTask {
+            manifest,
+            settings: test_settings(),
+            event_sender: sender,
+            cancellation_token: CancellationToken::new(),
+            global_permits: Arc::new(Semaphore::new(8)),
+        })
+        .await
+        .expect("任务 B 失败")
+    });
+
+    let snapshot_a = task_a.await.expect("任务 A panic");
+    let snapshot_b = task_b.await.expect("任务 B panic");
+
+    let output_a = output_of(&snapshot_a);
+    let output_b = output_of(&snapshot_b);
+    // 名字相同会触发唯一化，文件名必然不同，但内容必须各是各的。
+    assert_ne!(output_a, output_b, "输出文件路径不应相同");
+    let content_a = std::fs::read(&output_a).expect("读取 A 输出失败");
+    let content_b = std::fs::read(&output_b).expect("读取 B 输出失败");
+    assert_ne!(
+        content_a, content_b,
+        "两个任务输出了相同内容——并发合并中间文件互相覆盖了"
+    );
+    assert_eq!(content_a, flatten(&segments_a));
+    assert_eq!(content_b, flatten(&segments_b));
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 同时并发合并两个同名任务的分片，输出路径必须不同、内容必须各是各的。
+///
+/// 与 `concurrent_same_name_tasks_produce_distinct_outputs` 不同：这里直接调
+/// `merge_segments` 并用 `tokio::join!` 让两次合并**严格同时启动**，没有下载阶段
+/// 的时间差，确保合并阶段的并发重叠是确定的（而非依赖下载快慢的巧合时序）。
+#[tokio::test]
+async fn concurrent_merges_same_name_produce_distinct_outputs() {
+    let directory = temp_dir("concurrent-merge");
+    // 两个任务各自的中间分片，合并后内容必然不同。
+    let segment_a = ts_segment(6, 0x33);
+    let segment_b = ts_segment(6, 0x44);
+    let segment_path_a = directory.join("seg_a.ts");
+    let segment_path_b = directory.join("seg_b.ts");
+    std::fs::write(&segment_path_a, &segment_a).expect("写入 A 分片失败");
+    std::fs::write(&segment_path_b, &segment_b).expect("写入 B 分片失败");
+
+    // 两路合并同时启动，各自输出 video.ts 应被唯一化，内容各是各的。
+    // 分片列表先绑定 let：直接内联临时切片会被 async 函数持有期间提前释放（E0716）。
+    let segments_a = vec![segment_path_a];
+    let segments_b = vec![segment_path_b];
+    let (result_a, result_b) = tokio::join!(
+        merge_segments(&segments_a, None, &directory, "video", false, None),
+        merge_segments(&segments_b, None, &directory, "video", false, None),
+    );
+    let output_a = result_a.expect("合并 A 失败").output_path;
+    let output_b = result_b.expect("合并 B 失败").output_path;
+
+    assert_ne!(output_a, output_b, "并发同名合并的输出路径必须不同");
+    assert_eq!(
+        std::fs::read(&output_a).expect("读取 A 输出失败"),
+        segment_a
+    );
+    assert_eq!(
+        std::fs::read(&output_b).expect("读取 B 输出失败"),
+        segment_b
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 合并完成后输出目录里不应该残留空占位文件。
+///
+/// `unique_output_path` 通过 create_new 占位保证路径唯一；正常路径下调用方的
+/// rename / ffmpeg 覆盖会清理它，但失败路径上必须显式删除，否则会留下大小为 0
+/// 的同名文件污染输出目录、并让下次同名任务拿不到干净的原名。
+#[tokio::test]
+async fn merge_leaves_no_empty_reservation_files() {
+    let directory = temp_dir("no-residue");
+    let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
+    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    for (index, data) in segments.iter().enumerate() {
+        routes.insert(format!("/seg{index}.ts"), data.clone());
+    }
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 3, None).into_bytes(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let snapshot = run_download(
+        &directory,
+        &server.url("/video.m3u8"),
+        "video",
+        test_settings(),
+    )
+    .await;
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+
+    // 扫描输出目录：合并期间生成的中间文件（.cat-catch- 前缀的临时文件、raw.mp4、
+    // .temporary.ts、concat 列表）应当全部清理；空占位文件更不能留。
+    // 目录（含任务临时目录 .cat-catch-tasks/）是合法存在，只检查文件。
+    for entry in std::fs::read_dir(&directory)
+        .expect("读取输出目录失败")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(!name.starts_with(".cat-catch-"), "残留合并中间文件：{name}");
+        // 排除合法输出 video.ts，看还有没有别的文件。
+        if name == "video.ts" {
+            continue;
+        }
+        panic!("输出目录有未预期的文件：{name}");
+    }
 
     let _ = std::fs::remove_dir_all(&directory);
 }

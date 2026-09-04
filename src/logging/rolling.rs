@@ -120,9 +120,25 @@ pub struct LoggingGuard {
     _file: Option<Arc<Mutex<LogFile>>>,
 }
 
-pub fn init(config: &LoggingConfig) -> LoggingGuard {
+/// 初始化日志；返回文件日志不可用时的警告（仅当请求了文件日志但打开失败时）。
+///
+/// 发布版不挂控制台（windows_subsystem），文件日志打不开时 stdout 又是空转——
+/// 用户会完全无感知地失去所有日志。这里把警告带出来，由入口把它显示到 GUI 日志面板。
+pub fn init(config: &LoggingConfig) -> (LoggingGuard, Option<String>) {
     let file = if config.file_enabled {
-        LogFile::open(log_directory(), config).map(|file| Arc::new(Mutex::new(file)))
+        match LogFile::open(log_directory(), config) {
+            Some(file) => Some(Arc::new(Mutex::new(file))),
+            None => {
+                tracing::warn!("文件日志不可用：logs 目录或日志文件创建失败，日志仅保留在内存");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let warning = if config.file_enabled && file.is_none() {
+        Some("文件日志不可用：程序所在目录不可写，运行日志仅保留在本窗口的日志面板".to_string())
     } else {
         None
     };
@@ -143,21 +159,13 @@ pub fn init(config: &LoggingConfig) -> LoggingGuard {
         }
     }
 
-    LoggingGuard { _file: file }
+    (LoggingGuard { _file: file }, warning)
 }
 
 fn log_directory() -> PathBuf {
-    let executable_directory = std::env::current_exe()
+    let directory = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|path| path.to_path_buf()));
-    if let Some(directory) = executable_directory {
-        let logs = directory.join("logs");
-        if std::fs::create_dir_all(&logs).is_ok() && logs.is_dir() {
-            return logs;
-        }
-    }
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cat-catch-assistant")
-        .join("logs")
+        .and_then(|path| path.parent().map(|path| path.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    directory.join("logs")
 }

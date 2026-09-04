@@ -7,7 +7,7 @@ use super::{
     theme,
     widgets::{
         card, form_field, form_field_multiline, form_field_with_hint, number_input, outline_button,
-        path_dialog_string, primary_button, right_label, FORM_LABEL_WIDTH,
+        path_dialog_string, primary_button, readonly_form_field, right_label, FORM_LABEL_WIDTH,
     },
 };
 
@@ -68,20 +68,11 @@ fn render_single_task_form(ui: &mut egui::Ui, state: &mut AppState) {
     ) {
         state.paste_from_clipboard();
     }
-    let pick_path = form_field(
-        ui,
-        "保存路径",
-        &mut state.single_path,
-        &state.settings.download_path,
-        Some("选择"),
-    );
+    // 保存路径只读展示设置里的默认路径；修改只能通过「选择」按钮（改设置并落盘）。
+    let pick_path =
+        readonly_form_field(ui, "保存路径", &state.settings.download_path, Some("选择"));
     if pick_path {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            match path_dialog_string(&path) {
-                Some(text) => state.single_path = text,
-                None => state.notify_error("所选路径包含无法识别的字符，未能应用"),
-            }
-        }
+        state.pick_download_directory();
     }
 
     form_field(ui, "文件名", &mut state.single_name, "留空自动生成", None);
@@ -111,20 +102,11 @@ fn render_single_task_form(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_batch_task_form(ui: &mut egui::Ui, state: &mut AppState) {
-    let pick_path = form_field(
-        ui,
-        "保存路径",
-        &mut state.batch_path,
-        &state.settings.download_path,
-        Some("选择"),
-    );
+    // 与单个任务页一致：保存路径只读展示，选择按钮改设置。
+    let pick_path =
+        readonly_form_field(ui, "保存路径", &state.settings.download_path, Some("选择"));
     if pick_path {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            match path_dialog_string(&path) {
-                Some(text) => state.batch_path = text,
-                None => state.notify_error("所选路径包含无法识别的字符，未能应用"),
-            }
-        }
+        state.pick_download_directory();
     }
     form_field_multiline(
         ui,

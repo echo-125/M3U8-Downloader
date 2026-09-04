@@ -11,10 +11,17 @@ use crate::app::CatCatchApp;
 use crate::config::Settings;
 
 fn main() -> eframe::Result {
-    let (settings, warning) = Settings::load_or_default(None);
-    let _logging_guard = logging::init(&settings.logging);
+    let (settings, mut warning) = Settings::load_or_default(None);
+    let (_logging_guard, logging_warning) = logging::init(&settings.logging);
     tracing::info!("应用启动");
-    if let Some(message) = &warning {
+    if let Some(message) = &logging_warning {
+        // 文件日志打不开时用户没有任何渠道看到 warning：合并进配置警告一起显示。
+        warning = match warning {
+            Some(existing) => Some(format!("{existing}\n{message}")),
+            None => Some(message.clone()),
+        };
+        tracing::warn!("{message}");
+    } else if let Some(message) = &warning {
         tracing::warn!("{message}");
     }
 

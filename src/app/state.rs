@@ -7,6 +7,7 @@ use std::{
 
 use url::Url;
 
+use super::widgets::path_dialog_string;
 use crate::{
     config::{default_config_path, ProxyScheme, Settings, ThemeKind},
     core::{
@@ -74,12 +75,10 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub creation_tab: CreationTab,
     pub single_url: String,
-    pub single_path: String,
     pub single_name: String,
     pub single_workers: usize,
     pub single_headers: String,
     pub batch_text: String,
-    pub batch_path: String,
     pub manual_folder: String,
     pub manual_output_name: String,
     pub manual_convert_to_mp4: bool,
@@ -129,7 +128,7 @@ impl AppState {
             }
         };
         if !resume_directories.contains(&download_path) {
-            resume_directories.push(download_path);
+            resume_directories.push(download_path.clone());
         }
         let default_workers = settings.max_workers;
         let manager = TaskManager::new(settings.clone(), task_registry_path);
@@ -144,6 +143,8 @@ impl AppState {
             logs.push_warning(warning);
         }
 
+        // 默认下载路径只存在 `settings.download_path` 一处；主界面只读展示，
+        // 「选择」按钮直接改设置并落盘，避免出现「两处不同步」的 bug。
         let state = Self {
             manager,
             settings,
@@ -151,12 +152,10 @@ impl AppState {
             config_path,
             creation_tab: CreationTab::Single,
             single_url: String::new(),
-            single_path: String::new(),
             single_name: String::new(),
             single_workers: default_workers,
             single_headers: String::new(),
             batch_text: String::new(),
-            batch_path: String::new(),
             manual_folder: String::new(),
             manual_output_name: String::new(),
             manual_convert_to_mp4: true,
@@ -343,7 +342,7 @@ impl AppState {
             self.notify_error("任务添加失败：M3U8 链接必须是有效的 HTTP 或 HTTPS 地址");
             return;
         }
-        let output_directory = self.output_directory(&self.single_path);
+        let output_directory = self.output_directory();
         let output_name = if self.single_name.trim().is_empty() {
             derive_output_name(&url)
         } else {
@@ -363,7 +362,7 @@ impl AppState {
 
     pub fn add_batch_tasks(&mut self) {
         let text = self.batch_text.clone();
-        let output_directory = self.output_directory(&self.batch_path);
+        let output_directory = self.output_directory();
         let max_workers = self.settings.max_workers;
         let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, true);
         if valid > 0 {
@@ -387,9 +386,8 @@ impl AppState {
             self.show_toast("粘贴添加失败：剪贴板为空", true);
             return;
         }
-        // 按钮在单个任务页，因此沿用该页的保存路径与线程数。
         // 粘贴添加不自动开始：批量内容可能包含用户想先检查的链接，保持「等待中」。
-        let output_directory = self.output_directory(&self.single_path);
+        let output_directory = self.output_directory();
         let max_workers = self.single_workers.clamp(1, 64);
         let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, false);
         if valid == 0 {
@@ -753,12 +751,33 @@ impl AppState {
         }
     }
 
-    fn output_directory(&self, input: &str) -> PathBuf {
-        if input.trim().is_empty() {
-            self.settings.normalized_download_path()
-        } else {
-            PathBuf::from(input.trim())
+    /// 主界面与设置窗口共用的「选择下载目录」入口。
+    /// 选完直接改 `settings.download_path` 并落盘——路径只有这一个真身，
+    /// 两个界面展示的是同一份数据，不会出现「界面 A 改了、界面 B 还是旧值」。
+    pub fn pick_download_directory(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let Some(text) = path_dialog_string(&path) else {
+            self.notify_error("所选路径包含无法识别的字符，未能应用");
+            return;
+        };
+        self.settings.download_path = text;
+        // 落盘失败不能静默：exe 目录只读时（Program Files、写保护 U 盘）配置写不进去，
+        // 用户会以为改了路径，重启后却落回旧值。必须明确提示避免误解。
+        if let Err(error) = self.settings.save(Some(&self.config_path)) {
+            self.notify_error(format!("下载路径修改失败，重启后可能不生效：{error}"));
         }
+        // 核心侧的任务队列也用这份配置，通知它路径变了。
+        self.manager
+            .send(TaskCommand::UpdateSettings(self.settings.clone()));
+    }
+
+    /// 任务输出目录：始终使用设置里的默认下载路径。
+    /// 主界面不再有「单次任务用临时目录」的能力——所有任务用同一默认路径，
+    /// 想改的话点「选择」按钮（直接改设置）或进设置窗口。
+    fn output_directory(&self) -> PathBuf {
+        self.settings.normalized_download_path()
     }
 
     pub fn proxy_scheme_label(&self) -> &'static str {

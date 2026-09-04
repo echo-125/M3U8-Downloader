@@ -55,14 +55,15 @@ fn parse_version(first_line: &str) -> String {
 }
 
 /// fMP4 直接拼接的产物缺少索引，重封装一次并把 moov 前置，便于边下边播。
+///
+/// `output` 必须是调用方新占位的唯一路径（见 `core::merge::unique_output_path`）。
+/// ffmpeg 带 `-y` 会静默覆盖已存在的文件，本函数不再做 `output.exists()` 防御；
+/// 若传入已存在的旧文件会导致成品被覆盖。
 pub async fn remux_faststart(
     program: &str,
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, FfmpegError> {
-    if output.exists() {
-        return Err(FfmpegError::Execution("输出文件已存在".into()));
-    }
     let arguments = copy_arguments(input, output, true);
     let output_result = run_command(program, &arguments, Some(FFMPEG_TIMEOUT)).await?;
     if output_result.status.success() && output.is_file() {
@@ -74,15 +75,15 @@ pub async fn remux_faststart(
     )))
 }
 
+/// TS 分片合并后重封装为 MP4：先流拷贝，失败再重编码。
+///
+/// 契约同 `remux_faststart`：`output` 必须是调用方新占位的唯一路径，
+/// 否则 ffmpeg 的 `-y` 会静默覆盖已有文件。
 pub async fn remux_to_mp4(
     program: &str,
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, FfmpegError> {
-    if output.exists() {
-        return Err(FfmpegError::Execution("输出文件已存在".into()));
-    }
-
     let copy_arguments = copy_arguments(input, output, false);
     let output_result = run_command(program, &copy_arguments, Some(FFMPEG_TIMEOUT)).await?;
     if output_result.status.success() && output.is_file() {
@@ -105,14 +106,14 @@ pub async fn remux_to_mp4(
 ///
 /// 部分 fMP4 流没有独立的初始化段，分片各自携带 ftyp/moov，直接二进制拼接会
 /// 重复出现多次初始化信息而无法播放，必须交给 ffmpeg 按 concat 协议重新组装。
+///
+/// 契约同 `remux_faststart`：`output` 必须是调用方新占位的唯一路径，
+/// 否则 ffmpeg 的 `-y` 会静默覆盖已有文件。
 pub async fn concat_copy_to_mp4(
     program: &str,
     concat_list: &Path,
     output: &Path,
 ) -> Result<PathBuf, FfmpegError> {
-    if output.exists() {
-        return Err(FfmpegError::Execution("输出文件已存在".into()));
-    }
     let arguments = concat_arguments(concat_list, output);
     let output_result = run_command(program, &arguments, Some(FFMPEG_TIMEOUT)).await?;
     if output_result.status.success() && output.is_file() {
