@@ -121,10 +121,15 @@ fn render_batch_task_form(ui: &mut egui::Ui, state: &mut AppState) {
     );
 
     ui.add_space(2.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if primary_button(ui, true, "批量添加").clicked() {
-            state.add_batch_tasks();
-        }
+    // 必须包在 horizontal 里：裸用 with_layout 会占满卡片剩余高度，
+    // Align::Center 再把按钮垂直居中，整张「新建任务」卡片被撑到全屏高，
+    // 下面的任务列表会被挤出视口。
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if primary_button(ui, true, "批量添加").clicked() {
+                state.add_batch_tasks();
+            }
+        });
     });
 }
 
