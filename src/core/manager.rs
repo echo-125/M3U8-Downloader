@@ -41,10 +41,12 @@ impl TaskManager {
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let maximum_workers = settings.max_workers * settings.tail_boost as usize;
-        let task_permits = Arc::new(Semaphore::new(settings.max_concurrent_downloads));
-        let global_permits = Arc::new(Semaphore::new(
+        let task_permits = Arc::new(RwLock::new(Arc::new(Semaphore::new(
+            settings.max_concurrent_downloads,
+        ))));
+        let global_permits = Arc::new(RwLock::new(Arc::new(Semaphore::new(
             settings.max_concurrent_downloads * maximum_workers,
-        ));
+        ))));
         let settings = Arc::new(RwLock::new(settings));
 
         runtime.spawn(manager_loop(
@@ -98,8 +100,10 @@ struct TaskRuntime {
 struct ManagerState {
     tasks: Arc<Mutex<HashMap<u64, TaskRuntime>>>,
     settings: Arc<RwLock<Settings>>,
-    task_permits: Arc<Semaphore>,
-    global_permits: Arc<Semaphore>,
+    // 信号量随并发设置重建：容量改了要让新任务用新额度，正在跑的任务仍持有
+    // 旧 Arc，跑完自然释放，两者共存片刻不破坏「全局连接压力」约束。
+    task_permits: Arc<RwLock<Arc<Semaphore>>>,
+    global_permits: Arc<RwLock<Arc<Semaphore>>>,
     event_sender: mpsc::UnboundedSender<TaskEvent>,
     next_id: AtomicU64,
     next_run_id: AtomicU64,
@@ -118,8 +122,8 @@ async fn manager_loop(
     mut command_receiver: mpsc::UnboundedReceiver<TaskCommand>,
     event_sender: mpsc::UnboundedSender<TaskEvent>,
     settings: Arc<RwLock<Settings>>,
-    task_permits: Arc<Semaphore>,
-    global_permits: Arc<Semaphore>,
+    task_permits: Arc<RwLock<Arc<Semaphore>>>,
+    global_permits: Arc<RwLock<Arc<Semaphore>>>,
     task_registry_path: PathBuf,
 ) {
     let tasks = Arc::new(Mutex::new(HashMap::<u64, TaskRuntime>::new()));
@@ -137,16 +141,16 @@ async fn manager_loop(
     while let Some(command) = command_receiver.recv().await {
         match command {
             TaskCommand::Add(new_task) => add_task(&state, new_task),
-            TaskCommand::Start(id) => start_task(&state, id),
-            TaskCommand::StartAll => start_all_tasks(&state),
+            TaskCommand::Start(id) => start_task(&state, id).await,
+            TaskCommand::StartAll => start_all_tasks(&state).await,
             TaskCommand::Reset(ids) => {
                 for id in ids {
-                    reset_task(&state, id);
+                    reset_task(&state, id).await;
                 }
             }
-            TaskCommand::Retry(id) => start_task(&state, id),
-            TaskCommand::Delete(id) => delete_task(&state, id),
-            TaskCommand::RemoveFinished => remove_finished_tasks(&state),
+            TaskCommand::Retry(id) => start_task(&state, id).await,
+            TaskCommand::Delete(id) => delete_task(&state, id).await,
+            TaskCommand::RemoveFinished => remove_finished_tasks(&state).await,
             TaskCommand::EditTask {
                 id,
                 source_url,
@@ -164,7 +168,7 @@ async fn manager_loop(
                 )
                 .await
             }
-            TaskCommand::ClearFinished => clear_finished_tasks(&state),
+            TaskCommand::ClearFinished => clear_finished_tasks(&state).await,
             TaskCommand::ResumeTasks(directories) => resume_tasks(&state, directories),
             TaskCommand::UpdateSettings(new_settings) => update_settings(&state, new_settings),
             TaskCommand::DetectFfmpeg => {
@@ -249,10 +253,7 @@ fn add_task(state: &ManagerState, new_task: NewTask) {
     let _ = state
         .event_sender
         .send(TaskEvent::Snapshot(snapshot.clone()));
-    let _ = state.event_sender.send(TaskEvent::Log {
-        level: CoreLogLevel::Info,
-        message: format!("任务已添加：{}", manifest.output_name),
-    });
+    // 任务添加不写日志：列表出现新行即反馈，Info 回声会稀释文件日志里真正的错误。
     if new_task.auto_start {
         spawn_task(state, manifest, snapshot);
     } else {
@@ -295,8 +296,18 @@ fn register_idle_task(state: &ManagerState, manifest: TaskManifest, mut snapshot
 fn spawn_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSnapshot) {
     let tasks = state.tasks.clone();
     let settings = state.settings.clone();
-    let task_permits = state.task_permits.clone();
-    let global_permits = state.global_permits.clone();
+    // 读锁取出当前信号量：锁内只 clone Arc，真正的 acquire 在协程里进行，
+    // 设置更新换新信号量后，这个旧 Arc 的许可仍被本次运行有效持有。
+    let task_permits = state
+        .task_permits
+        .read()
+        .ok()
+        .map(|permits| permits.clone());
+    let global_permits = state
+        .global_permits
+        .read()
+        .ok()
+        .map(|permits| permits.clone());
     let event_sender = state.event_sender.clone();
     let cancellation_token = CancellationToken::new();
     let id = manifest.id;
@@ -309,13 +320,33 @@ fn spawn_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSn
     let _ = event_sender.send(TaskEvent::Snapshot(snapshot.clone()));
 
     let handle = tokio::spawn(async move {
+        let Some(task_permits) = task_permits else {
+            finish_task(
+                &tasks,
+                id,
+                run_id,
+                Err(CoreError::Io("读取任务并发许可失败".into())),
+                &event_sender,
+            );
+            return;
+        };
+        let Some(global_permits) = global_permits else {
+            finish_task(
+                &tasks,
+                id,
+                run_id,
+                Err(CoreError::Io("读取全局并发许可失败".into())),
+                &event_sender,
+            );
+            return;
+        };
         let task_permit = tokio::select! {
             permit = task_permits.acquire() => {
                 permit.map_err(|_| CoreError::Io("获取任务并发许可失败".into()))
             }
             _ = run_token.cancelled() => Err(CoreError::Canceled),
         };
-        let task_permit = match task_permit {
+        let _task_permit = match task_permit {
             Ok(task_permit) => task_permit,
             Err(_) => {
                 finish_task(&tasks, id, run_id, Err(CoreError::Canceled), &event_sender);
@@ -331,7 +362,7 @@ fn spawn_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSn
             global_permits,
         })
         .await;
-        drop(task_permit);
+        // task_permit 随作用域结束自动释放，再放任务进完成处理。
         finish_task(&tasks, id, run_id, result, &event_sender);
     });
 
@@ -356,40 +387,34 @@ fn finish_task(
     result: Result<TaskSnapshot, CoreError>,
     event_sender: &mpsc::UnboundedSender<TaskEvent>,
 ) {
-    // 任务可能已被删除，或已被重新开始的运行取代，此时应丢弃过期的结束事件。
-    let is_current_run = tasks
-        .lock()
-        .map(|tasks| {
-            tasks
-                .get(&id)
-                .is_some_and(|runtime| runtime.run_id == run_id)
-        })
-        .unwrap_or(false);
-    if !is_current_run {
-        return;
-    }
-
-    let final_snapshot = match result {
-        Ok(snapshot) => Some(snapshot),
-        Err(CoreError::Canceled) => Some(TaskSnapshot {
-            status: TaskStatus::Canceled,
-            detail: "任务已取消".to_string(),
-            ..task_snapshot(tasks, id)
-        }),
-        Err(error) => Some(TaskSnapshot {
-            status: TaskStatus::Failed,
-            detail: error.user_message(),
-            ..task_snapshot(tasks, id)
-        }),
-    };
-    let Some(snapshot) = final_snapshot else {
-        return;
-    };
-    if let Ok(mut tasks) = tasks.lock() {
-        if let Some(runtime) = tasks.get_mut(&id) {
-            runtime.snapshot = snapshot.clone();
+    // 在一次锁内完成「run_id 校验 → 基线快照 → 写回」三步：分开取锁会让
+    // start_task 在两步之间换掉 runtime，导致旧运行的终态覆盖新运行的快照。
+    let snapshot = {
+        let Ok(mut tasks) = tasks.lock() else {
+            return;
+        };
+        let Some(runtime) = tasks.get_mut(&id) else {
+            return;
+        };
+        if runtime.run_id != run_id {
+            return;
         }
-    }
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(CoreError::Canceled) => TaskSnapshot {
+                status: TaskStatus::Canceled,
+                detail: "任务已取消".to_string(),
+                ..runtime.snapshot.clone()
+            },
+            Err(error) => TaskSnapshot {
+                status: TaskStatus::Failed,
+                detail: error.user_message(),
+                ..runtime.snapshot.clone()
+            },
+        };
+        runtime.snapshot = snapshot.clone();
+        snapshot
+    };
     let _ = event_sender.send(TaskEvent::Snapshot(snapshot.clone()));
     let (level, message) = match snapshot.status {
         TaskStatus::Completed => (
@@ -402,7 +427,15 @@ fn finish_task(
         ),
         TaskStatus::Failed => (
             CoreLogLevel::Error,
-            format!("任务失败：{}，{}", snapshot.output_name, snapshot.detail),
+            // 失败日志带上任务的原始信息：这是排查防盗链失效、链接过期等问题时
+            // 唯一能还原现场的地方，文件日志里不再有其他任务级 Info 可查。
+            format!(
+                "任务失败：{}，{}。链接：{}，保存目录：{}",
+                snapshot.output_name,
+                snapshot.detail,
+                snapshot.source_url,
+                snapshot.output_directory
+            ),
         ),
         _ => (
             CoreLogLevel::Warning,
@@ -414,40 +447,26 @@ fn finish_task(
         ),
     };
     let _ = event_sender.send(TaskEvent::Log { level, message });
+    // 取消不等于失败：Canceled 按中性提示收尾，避免把「用户主动停下」报成错误。
+    let (toast_message, toast_error) = match snapshot.status {
+        TaskStatus::Completed => (format!("下载完成：{}", snapshot.output_name), false),
+        TaskStatus::Canceled => (format!("任务已取消：{}", snapshot.output_name), false),
+        _ => (format!("任务失败：{}", snapshot.output_name), true),
+    };
     let _ = event_sender.send(TaskEvent::Toast {
-        message: if snapshot.status == TaskStatus::Completed {
-            format!("下载完成：{}", snapshot.output_name)
-        } else {
-            format!("任务失败：{}", snapshot.output_name)
-        },
-        error: snapshot.status != TaskStatus::Completed,
+        message: toast_message,
+        error: toast_error,
     });
 }
 
-fn task_snapshot(tasks: &Arc<Mutex<HashMap<u64, TaskRuntime>>>, id: u64) -> TaskSnapshot {
-    tasks
-        .lock()
-        .ok()
-        .and_then(|tasks| tasks.get(&id).map(|runtime| runtime.snapshot.clone()))
-        .unwrap_or_else(|| TaskSnapshot {
-            id,
-            source_url: String::new(),
-            output_name: String::new(),
-            output_directory: String::new(),
-            request_headers: String::new(),
-            status: TaskStatus::Failed,
-            completed_segments: 0,
-            total_segments: 0,
-            progress: 0.0,
-            speed_bytes_per_second: 0,
-            estimated_seconds_remaining: 0,
-            detail: "任务状态丢失".to_string(),
-            output_path: None,
-        })
-}
-
-fn start_task(state: &ManagerState, id: u64) {
-    if let Ok(mut tasks) = state.tasks.lock() {
+/// 启动任务。完成态重下时先把「已重置」状态落盘，再重建运行协程；
+/// 落盘是同步文件 IO，放锁后执行，避免持锁期间卡住其他任务的事件处理。
+async fn start_task(state: &ManagerState, id: u64) {
+    // 锁内只取决定启动所需的数据，不做任何 IO。
+    let pending = {
+        let Ok(mut tasks) = state.tasks.lock() else {
+            return;
+        };
         let Some(runtime) = tasks.get_mut(&id) else {
             return;
         };
@@ -458,31 +477,36 @@ fn start_task(state: &ManagerState, id: u64) {
         if !runtime.snapshot.status.is_startable() {
             return;
         }
-        if runtime.manifest.completed {
-            runtime.manifest.completed = false;
-            runtime.manifest.output_path = None;
-            if let Err(error) = runtime.manifest.save() {
-                let message = format!("重试失败：{}", error.user_message());
-                let _ = state.event_sender.send(TaskEvent::Log {
-                    level: CoreLogLevel::Error,
-                    message: message.clone(),
-                });
-                let _ = state.event_sender.send(TaskEvent::Toast {
-                    message,
-                    error: true,
-                });
-                return;
-            }
-        }
         let manifest = runtime.manifest.clone();
         let snapshot = runtime.snapshot.clone();
         runtime.handle.abort();
-        drop(tasks);
-        spawn_task(state, manifest, snapshot);
+        Some((manifest, snapshot))
+    };
+    let Some((mut manifest, snapshot)) = pending else {
+        return;
+    };
+    if manifest.completed {
+        manifest.completed = false;
+        manifest.output_path = None;
+        // 放锁后落盘：任务表不会因为一次慢写盘而停摆。
+        // save 只读 manifest，克隆一份进阻塞线程池，原件留给下面的 spawn_task。
+        let saved = manifest.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || saved.save())
+            .await
+            .unwrap_or(Err(CoreError::Io("保存任务信息失败".into())))
+        {
+            send_log_and_toast(
+                &state.event_sender,
+                CoreLogLevel::Error,
+                format!("重试失败：{}", error.user_message()),
+            );
+            return;
+        }
     }
+    spawn_task(state, manifest, snapshot);
 }
 
-fn start_all_tasks(state: &ManagerState) {
+async fn start_all_tasks(state: &ManagerState) {
     let ids: Vec<u64> = state
         .tasks
         .lock()
@@ -495,13 +519,14 @@ fn start_all_tasks(state: &ManagerState) {
         })
         .unwrap_or_default();
     for id in ids {
-        start_task(state, id);
+        start_task(state, id).await;
     }
 }
 
 /// 重置任务：停止下载、删除已下载的分片、恢复「等待中」，不保留断点续传。
 /// 已完成的任务不参与重置（成品不该被删）。
-fn reset_task(state: &ManagerState, id: u64) {
+async fn reset_task(state: &ManagerState, id: u64) {
+    // 锁内只做停止和取数据；删分片目录是慢 IO，放到阻塞线程池。
     let pending = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
@@ -521,36 +546,101 @@ fn reset_task(state: &ManagerState, id: u64) {
         }
         runtime.cancellation_token.cancel();
         runtime.handle.abort();
-        // 清空已下载的分片，重置后从头下载。分片目录要重建，否则 manifest 无处落盘，
-        // 任务会停在内存里、重启后彻底消失。
-        if let Err(error) = runtime.manifest.reset_for_redownload() {
-            let _ = state.event_sender.send(TaskEvent::Log {
-                level: CoreLogLevel::Error,
-                message: format!("重置任务失败：{}", error.user_message()),
-            });
-        }
+        // 进入「取消中」：清分片是慢 IO，界面要能看出任务在收尾而不是卡住了。
+        // register_idle_task 会在重置完成后把它改回「等待中」。
+        runtime.snapshot.status = TaskStatus::Canceling;
+        runtime.snapshot.detail = "正在取消，清理已下载分片".to_string();
         Some((runtime.manifest.clone(), runtime.snapshot.clone()))
     };
-    let Some((manifest, snapshot)) = pending else {
+    let Some((mut manifest, snapshot)) = pending else {
         return;
     };
+    let _ = state
+        .event_sender
+        .send(TaskEvent::Snapshot(snapshot.clone()));
+    // 清空已下载的分片，重置后从头下载。分片目录要重建，否则 manifest 无处落盘，
+    // 任务会停在内存里、重启后彻底消失。阻塞线程池执行，不卡管理循环；
+    // reset_for_redownload 会修改 manifest，闭包把它一并返回，供重建占位任务用。
+    let reset_result = tokio::task::spawn_blocking(move || {
+        let result = manifest.reset_for_redownload();
+        (result, manifest)
+    })
+    .await;
+    // 协程被中断（理论极罕见）时重置未完成，直接放弃重建，任务表里的旧记录由
+    // 后续删除/重置命令处理。
+    let Ok((reset_result, manifest)) = reset_result else {
+        return;
+    };
+    if let Err(error) = reset_result {
+        let _ = state.event_sender.send(TaskEvent::Log {
+            level: CoreLogLevel::Error,
+            message: format!("重置任务失败：{}", error.user_message()),
+        });
+        return;
+    }
     register_idle_task(state, manifest, snapshot);
 }
 
-/// 移除所有已完成和已失败的任务（界面「删除」按钮，无视勾选）。
-fn remove_finished_tasks(state: &ManagerState) {
+/// 停止已移除任务的协程。只下发取消并标记 abort，不等待结束，可同步调用。
+fn stop_removed(removed: &[TaskRuntime]) {
+    for runtime in removed {
+        runtime.cancellation_token.cancel();
+        runtime.handle.abort();
+    }
+}
+
+/// 已移除任务的收尾：给未完成任务打 dismissed 标记，可选清理临时目录。
+///
+/// 两者都是同步文件 IO，临时目录可能有几个 GB。删除命令是在管理循环里处理的，
+/// 同步执行会占住 worker 线程，让所有任务的事件处理跟着一起停摆，因此必须放进
+/// 阻塞线程池。
+///
+/// 顺序不能反：先打标记再删目录。目录被占用删不掉时，manifest 若没标记，
+/// 重启后任务会「死而复生」。
+async fn finalize_removed(removed: Vec<TaskRuntime>, remove_directory: bool) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+        for runtime in removed {
+            let mut manifest = runtime.manifest;
+            if !manifest.completed {
+                if let Err(error) = manifest.mark_dismissed() {
+                    warnings.push(format!("标记已删除任务失败：{}", error.user_message()));
+                }
+            }
+            if remove_directory {
+                if let Err(error) = safe_remove_directory(&manifest.task_directory()) {
+                    warnings.push(format!("清理任务临时文件失败：{}", error.user_message()));
+                }
+            }
+        }
+        warnings
+    })
+    .await
+    .unwrap_or_else(|_| vec!["清理任务失败：收尾协程异常终止".to_string()])
+}
+
+fn emit_warnings(state: &ManagerState, warnings: Vec<String>) {
+    for message in warnings {
+        let _ = state.event_sender.send(TaskEvent::Log {
+            level: CoreLogLevel::Warning,
+            message,
+        });
+    }
+}
+
+/// 移除所有已结束的任务（界面「删除」按钮，无视勾选）。
+///
+/// 「已结束」= 已完成 / 已失败 / 已取消，即所有非进行中的任务。这个语义是用户
+/// 拍板的行为约定（见 AGENTS.md 与 README），不得收窄回「仅已完成与已失败」。
+/// 与「清空」的分工：本函数会清理临时分片目录，清空只移出列表不删文件。
+async fn remove_finished_tasks(state: &ManagerState) {
     let removed: Vec<TaskRuntime> = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
         };
         let finished: Vec<u64> = tasks
             .values()
-            .filter(|runtime| {
-                matches!(
-                    runtime.snapshot.status,
-                    TaskStatus::Completed | TaskStatus::Failed
-                )
-            })
+            .filter(|runtime| !runtime.snapshot.status.is_active())
             .map(|runtime| runtime.manifest.id)
             .collect();
         finished.iter().filter_map(|id| tasks.remove(id)).collect()
@@ -558,66 +648,33 @@ fn remove_finished_tasks(state: &ManagerState) {
     if removed.is_empty() {
         return;
     }
-    for runtime in &removed {
-        runtime.cancellation_token.cancel();
-        runtime.handle.abort();
-        // 未完成的（失败）任务要打标记，避免重启后作为断点续传重新载入。
-        if !runtime.manifest.completed {
-            let mut manifest = runtime.manifest.clone();
-            if let Err(error) = manifest.mark_dismissed() {
-                let _ = state.event_sender.send(TaskEvent::Log {
-                    level: CoreLogLevel::Warning,
-                    message: format!("标记已删除任务失败：{}", error.user_message()),
-                });
-            }
-        }
-        // 清理临时分片目录。
-        if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
-            let _ = state.event_sender.send(TaskEvent::Log {
-                level: CoreLogLevel::Warning,
-                message: format!("清理任务临时文件失败：{}", error.user_message()),
-            });
-        }
-    }
     let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
+    stop_removed(&removed);
+    // 未完成的（失败 / 取消）任务要打标记，避免重启后作为断点续传重新载入；
+    // 同时清掉临时分片目录。两步都是同步 IO，走阻塞线程池。
+    emit_warnings(state, finalize_removed(removed, true).await);
     let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
 }
 
-fn delete_task(state: &ManagerState, id: u64) {
+async fn delete_task(state: &ManagerState, id: u64) {
     let removed = state
         .tasks
         .lock()
         .ok()
         .and_then(|mut tasks| tasks.remove(&id));
-    let Some(mut runtime) = removed else {
+    let Some(runtime) = removed else {
         // 任务已不存在时也要通知界面移除对应行，否则会残留一个永远无法操作的幽灵任务。
         let _ = state
             .event_sender
             .send(TaskEvent::TasksRemoved { ids: vec![id] });
         return;
     };
-    runtime.cancellation_token.cancel();
-    runtime.handle.abort();
+    stop_removed(std::slice::from_ref(&runtime));
     // 先打 dismissed 标记再删目录。反过来做的话，一旦目录被占用删不掉，
     // manifest 还在且没有标记，重启后任务会「死而复生」。
-    if !runtime.manifest.completed {
-        if let Err(error) = runtime.manifest.mark_dismissed() {
-            let _ = state.event_sender.send(TaskEvent::Log {
-                level: CoreLogLevel::Warning,
-                message: format!("标记已删除任务失败：{}", error.user_message()),
-            });
-        }
-    }
-    if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
-        let _ = state.event_sender.send(TaskEvent::Log {
-            level: CoreLogLevel::Warning,
-            message: format!("清理临时文件失败：{}", error.user_message()),
-        });
-    }
-    let _ = state.event_sender.send(TaskEvent::Log {
-        level: CoreLogLevel::Info,
-        message: format!("任务已删除：{}", runtime.manifest.output_name),
-    });
+    // 两步都是同步 IO，走阻塞线程池。
+    emit_warnings(state, finalize_removed(vec![runtime], true).await);
+    // 删除动作不写日志：TasksRemoved 事件已让界面移除对应行，写入 Info 只会稀释错误。
     let _ = state
         .event_sender
         .send(TaskEvent::TasksRemoved { ids: vec![id] });
@@ -780,10 +837,7 @@ fn apply_edited_manifest(state: &ManagerState, id: u64, updated: TaskManifest) -
     let snapshot = runtime.snapshot.clone();
     drop(tasks);
     let _ = state.event_sender.send(TaskEvent::Snapshot(snapshot));
-    let _ = state.event_sender.send(TaskEvent::Log {
-        level: CoreLogLevel::Info,
-        message: "任务已更新".to_string(),
-    });
+    // 任务编辑不写日志：界面快照已同步刷新，Info 回声会稀释文件日志。
     EditOutcome::Applied
 }
 
@@ -819,7 +873,8 @@ fn copy_directory(from: &Path, to: &Path) -> Result<(), CoreError> {
 }
 
 /// 清除所有已结束的任务（已完成、已失败、已取消）。
-fn clear_finished_tasks(state: &ManagerState) {
+/// 只把任务从列表移除并打 dismissed 标记，不删任何本地文件。
+async fn clear_finished_tasks(state: &ManagerState) {
     let removed: Vec<TaskRuntime> = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
@@ -835,31 +890,10 @@ fn clear_finished_tasks(state: &ManagerState) {
         return;
     }
     let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
-    let mut dismissed = 0;
-    for runtime in &removed {
-        runtime.cancellation_token.cancel();
-        runtime.handle.abort();
-        // 未完成的任务被清除后要打标记，否则重启后会被断点续传重新载入。
-        if !runtime.manifest.completed {
-            let mut manifest = runtime.manifest.clone();
-            if let Err(error) = manifest.mark_dismissed() {
-                let _ = state.event_sender.send(TaskEvent::Log {
-                    level: CoreLogLevel::Warning,
-                    message: format!("标记已清除任务失败：{}", error.user_message()),
-                });
-                continue;
-            }
-            dismissed += 1;
-        }
-    }
-    let _ = state.event_sender.send(TaskEvent::Log {
-        level: CoreLogLevel::Info,
-        message: format!(
-            "已清除 {} 个已结束的任务，其中 {} 个未完成任务不再自动续传",
-            removed.len(),
-            dismissed
-        ),
-    });
+    stop_removed(&removed);
+    // 未完成的任务被清除后要打标记，否则重启后会被断点续传重新载入。
+    // 清除动作不写日志：TasksRemoved 事件已驱动界面移除对应行。
+    emit_warnings(state, finalize_removed(removed, false).await);
     let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
 }
 
@@ -884,25 +918,37 @@ fn resume_tasks(state: &ManagerState, directories: Vec<PathBuf>) {
         let _ = state
             .event_sender
             .send(TaskEvent::Snapshot(snapshot.clone()));
-        let _ = state.event_sender.send(TaskEvent::Log {
-            level: CoreLogLevel::Info,
-            message: format!("发现未完成任务：{}", manifest.output_name),
-        });
-        spawn_task(state, manifest, snapshot);
+        // 恢复任务不写日志：界面出现「等待中」的新行即反馈，N 个任务 N 条 Info 是噪音。
+        // 恢复为「等待中」而不是直接开始：上次退出时有多少未完成任务不受用户控制，
+        // 一启动就全量排队开跑既可能是意外，也会立刻吃满并发额度。
+        // 已下载的分片仍在磁盘上，用户点「开始」时按断点续传接着下。
+        register_idle_task(state, manifest, snapshot);
     }
 }
 
 fn update_settings(state: &ManagerState, settings: Settings) {
-    let mut current = match state.settings.write() {
-        Ok(current) => current,
-        Err(error) => error.into_inner(),
-    };
-    *current = settings;
-    drop(current);
-    let _ = state.event_sender.send(TaskEvent::Log {
-        level: CoreLogLevel::Info,
-        message: "设置已更新，新任务将使用新配置".to_string(),
-    });
+    {
+        let mut current = match state.settings.write() {
+            Ok(current) => current,
+            Err(error) => error.into_inner(),
+        };
+        *current = settings.clone();
+    }
+    // 按新配置重建并发信号量：容量变了要立即对新任务生效。正在跑的任务仍持
+    // 旧 Arc<Semaphore> 的许可，跑完自动释放，不会超额也不丢额度。
+    let maximum_workers = settings.max_workers * settings.tail_boost as usize;
+    *state
+        .task_permits
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) =
+        Arc::new(Semaphore::new(settings.max_concurrent_downloads));
+    *state
+        .global_permits
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = Arc::new(Semaphore::new(
+        settings.max_concurrent_downloads * maximum_workers,
+    ));
+    // 设置更新不写日志：保存动作在 GUI 侧已有 Toast 反馈。
 }
 
 fn initial_snapshot(manifest: &TaskManifest) -> TaskSnapshot {
@@ -956,6 +1002,8 @@ async fn merge_folder(
         &output_name,
         convert_to_mp4,
         ffmpeg_program.as_deref(),
+        // 手动合并没有取消入口，传一个不会被取消的 token 满足签名。
+        &CancellationToken::new(),
     )
     .await
     .map_err(|error| error.user_message())

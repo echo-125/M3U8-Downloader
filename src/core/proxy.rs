@@ -7,8 +7,15 @@ use crate::{
     core::{error::CoreError, headers::validate_headers},
 };
 
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 连接超时：建立连接（含 TLS 握手）的上限。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单个请求的总超时，从开始连接一直覆盖到响应体读完。
+///
+/// 不能照「请求应该很快」的直觉设成几十秒：分片可能有几十 MB，慢速网络下光传输就
+/// 要几分钟，而这个超时覆盖整个过程——设短了会让大分片必然超时，再被重试逻辑重下
+/// 三次，最后仍是失败。区分「传得慢」和「根本没在传」是下载侧空闲超时的事
+/// （见 `downloader::STALLED_TIMEOUT`），这里只兜底防止极慢的流无限占着连接。
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn build_client(
     settings: &Settings,

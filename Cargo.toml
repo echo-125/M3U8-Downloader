@@ -1,6 +1,6 @@
 [package]
 name = "cat-catch-assistant"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 # 包名保持 ASCII，产物名通过 [[bin]] 指定为中文。
 autobins = false
@@ -29,7 +29,9 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["full"] }
+# 按实际使用精简，不启用 full：生产代码用到 rt-multi-thread / sync / fs / io-util /
+# time / process（ffmpeg），net 只被 e2e 测试的本地服务器用到，一并声明避免拆 dev-dependencies。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "fs", "io-util", "time", "process"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"

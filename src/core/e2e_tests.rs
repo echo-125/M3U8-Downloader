@@ -11,7 +11,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +29,7 @@ use crate::{
     config::Settings,
     core::{
         downloader::{run_task, DownloadTask},
+        error::CoreError,
         events::{TaskEvent, TaskSnapshot, TaskStatus},
         merge::merge_segments,
         task::{discover_task_manifests, TaskManifest},
@@ -34,13 +38,65 @@ use crate::{
 
 const TS_PACKET_SIZE: usize = 188;
 
+/// 一次响应：状态码 + 响应体，可选 Retry-After 头。
+#[derive(Clone)]
+struct TestResponse {
+    status: u16,
+    body: Vec<u8>,
+    retry_after: Option<String>,
+}
+
+impl TestResponse {
+    fn ok(body: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            body,
+            retry_after: None,
+        }
+    }
+}
+
+/// 有状态路由：每命中一次消耗一条脚本响应，脚本耗尽后回落到 `fallback`。
+struct ScriptedRoute {
+    script: Vec<TestResponse>,
+    fallback: TestResponse,
+    hits: AtomicUsize,
+}
+
+impl ScriptedRoute {
+    fn next_response(&self) -> TestResponse {
+        let hit = self.hits.fetch_add(1, Ordering::SeqCst);
+        self.script
+            .get(hit)
+            .cloned()
+            .unwrap_or_else(|| self.fallback.clone())
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+enum TestRoute {
+    Static(TestResponse),
+    Scripted(Arc<ScriptedRoute>),
+}
+
+impl From<Vec<u8>> for TestRoute {
+    fn from(body: Vec<u8>) -> Self {
+        TestRoute::Static(TestResponse::ok(body))
+    }
+}
+
 /// 极简 HTTP 服务器：按请求路径返回预设内容，够驱动下载核心即可，不实现完整 HTTP 语义。
+/// 脚本化路由把状态放在共享计数器里，让「前 N 次 429、之后 200」这类序列可以被测试。
 struct TestServer {
     address: SocketAddr,
 }
 
 impl TestServer {
-    async fn start(routes: HashMap<String, Vec<u8>>) -> Self {
+    async fn start(routes: HashMap<String, TestRoute>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("绑定本地端口失败");
@@ -59,7 +115,17 @@ impl TestServer {
     }
 }
 
-async fn serve_once(socket: &mut TcpStream, routes: &HashMap<String, Vec<u8>>) {
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        _ => "Unexpected",
+    }
+}
+
+async fn serve_once(socket: &mut TcpStream, routes: &HashMap<String, TestRoute>) {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
     // 读到请求头结束即可；请求体对 GET 没有意义，额外给一个上限防止异常连接拖住测试。
@@ -80,18 +146,28 @@ async fn serve_once(socket: &mut TcpStream, routes: &HashMap<String, Vec<u8>>) {
         .unwrap_or("/")
         .to_string();
 
-    let empty = Vec::new();
-    let (status, body) = match routes.get(&path) {
-        Some(body) => ("200 OK", body),
-        None => ("404 Not Found", &empty),
+    let response = match routes.get(&path) {
+        Some(TestRoute::Static(response)) => response.clone(),
+        Some(TestRoute::Scripted(route)) => route.next_response(),
+        None => TestResponse {
+            status: 404,
+            body: Vec::new(),
+            retry_after: None,
+        },
     };
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-        body.len()
+    let mut header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n",
+        response.status,
+        status_text(response.status),
+        response.body.len()
     );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    let _ = socket.write_all(&response).await;
+    if let Some(value) = &response.retry_after {
+        header.push_str(&format!("Retry-After: {value}\r\n"));
+    }
+    header.push_str("\r\n");
+    let mut bytes = header.into_bytes();
+    bytes.extend_from_slice(&response.body);
+    let _ = socket.write_all(&bytes).await;
     let _ = socket.flush().await;
 }
 
@@ -177,6 +253,46 @@ async fn run_download_with_events(
     (snapshot, snapshots)
 }
 
+/// 返回 `run_task` 的原始结果，供需要断言失败路径的用例使用。
+/// 成功路径请改用 `run_download`，它直接给出快照。
+async fn run_download_result(
+    directory: &Path,
+    playlist_url: &str,
+    name: &str,
+    settings: Settings,
+) -> Result<TaskSnapshot, CoreError> {
+    run_download_result_with_logs(directory, playlist_url, name, settings)
+        .await
+        .0
+}
+
+/// 同 `run_download_result`，但一并给出过程中产生的日志消息，供断言日志行为。
+async fn run_download_result_with_logs(
+    directory: &Path,
+    playlist_url: &str,
+    name: &str,
+    settings: Settings,
+) -> (Result<TaskSnapshot, CoreError>, Vec<String>) {
+    let manifest = TaskManifest::new(1, playlist_url, name, directory, 4, HashMap::new())
+        .expect("创建任务失败");
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let task = DownloadTask {
+        manifest,
+        settings,
+        event_sender: sender,
+        cancellation_token: CancellationToken::new(),
+        global_permits: Arc::new(Semaphore::new(8)),
+    };
+    let result = run_task(task).await;
+    let mut logs = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        if let TaskEvent::Log { message, .. } = event {
+            logs.push(message);
+        }
+    }
+    (result, logs)
+}
+
 async fn run_download(
     directory: &Path,
     playlist_url: &str,
@@ -208,13 +324,13 @@ fn flatten(segments: &[Vec<u8>]) -> Vec<u8> {
 async fn downloads_and_merges_ts_playlist() {
     let directory = temp_dir("ts");
     let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     for (index, data) in segments.iter().enumerate() {
-        routes.insert(format!("/seg{index}.ts"), data.clone());
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
     }
     routes.insert(
         "/video.m3u8".to_string(),
-        media_playlist("", 3, None).into_bytes(),
+        media_playlist("", 3, None).into_bytes().into(),
     );
 
     let server = TestServer::start(routes).await;
@@ -272,20 +388,20 @@ async fn concurrent_same_name_tasks_produce_distinct_outputs() {
     let segments_a: Vec<Vec<u8>> = (0..2).map(|_| ts_segment(6, 0x11)).collect();
     let segments_b: Vec<Vec<u8>> = (0..2).map(|_| ts_segment(6, 0x22)).collect();
 
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     for (index, data) in segments_a.iter().enumerate() {
-        routes.insert(format!("/a/seg{index}.ts"), data.clone());
+        routes.insert(format!("/a/seg{index}.ts"), data.clone().into());
     }
     for (index, data) in segments_b.iter().enumerate() {
-        routes.insert(format!("/b/seg{index}.ts"), data.clone());
+        routes.insert(format!("/b/seg{index}.ts"), data.clone().into());
     }
     routes.insert(
         "/a.m3u8".to_string(),
-        media_playlist("/a", 2, None).into_bytes(),
+        media_playlist("/a", 2, None).into_bytes().into(),
     );
     routes.insert(
         "/b.m3u8".to_string(),
-        media_playlist("/b", 2, None).into_bytes(),
+        media_playlist("/b", 2, None).into_bytes().into(),
     );
 
     let server = TestServer::start(routes).await;
@@ -364,9 +480,27 @@ async fn concurrent_merges_same_name_produce_distinct_outputs() {
     // 分片列表先绑定 let：直接内联临时切片会被 async 函数持有期间提前释放（E0716）。
     let segments_a = vec![segment_path_a];
     let segments_b = vec![segment_path_b];
+    let token_a = CancellationToken::new();
+    let token_b = CancellationToken::new();
     let (result_a, result_b) = tokio::join!(
-        merge_segments(&segments_a, None, &directory, "video", false, None),
-        merge_segments(&segments_b, None, &directory, "video", false, None),
+        merge_segments(
+            &segments_a,
+            None,
+            &directory,
+            "video",
+            false,
+            None,
+            &token_a
+        ),
+        merge_segments(
+            &segments_b,
+            None,
+            &directory,
+            "video",
+            false,
+            None,
+            &token_b
+        ),
     );
     let output_a = result_a.expect("合并 A 失败").output_path;
     let output_b = result_b.expect("合并 B 失败").output_path;
@@ -393,13 +527,13 @@ async fn concurrent_merges_same_name_produce_distinct_outputs() {
 async fn merge_leaves_no_empty_reservation_files() {
     let directory = temp_dir("no-residue");
     let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     for (index, data) in segments.iter().enumerate() {
-        routes.insert(format!("/seg{index}.ts"), data.clone());
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
     }
     routes.insert(
         "/video.m3u8".to_string(),
-        media_playlist("", 3, None).into_bytes(),
+        media_playlist("", 3, None).into_bytes().into(),
     );
 
     let server = TestServer::start(routes).await;
@@ -456,14 +590,14 @@ async fn decrypts_aes128_segments_before_merging() {
     let iv_hex: String = iv.iter().map(|byte| format!("{byte:02x}")).collect();
     let key_line = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"/key.bin\",IV=0x{iv_hex}");
 
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     for (index, data) in encrypted.iter().enumerate() {
-        routes.insert(format!("/seg{index}.ts"), data.clone());
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
     }
-    routes.insert("/key.bin".to_string(), key.to_vec());
+    routes.insert("/key.bin".to_string(), key.to_vec().into());
     routes.insert(
         "/video.m3u8".to_string(),
-        media_playlist("", 3, Some(&key_line)).into_bytes(),
+        media_playlist("", 3, Some(&key_line)).into_bytes().into(),
     );
 
     let server = TestServer::start(routes).await;
@@ -490,6 +624,179 @@ async fn decrypts_aes128_segments_before_merging() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// 密钥不对时解密必然失败。这条路径过去会把密文写进正常分片路径：
+/// 成品被污染，而断点续传按 is_file() 判定分片「已完成」，重启后不会重下，
+/// 损坏无法自愈。这里锁定新行为——只归档、不落盘、任务明确失败。
+#[tokio::test]
+async fn undecrypted_segments_stay_off_disk_and_fail_the_task() {
+    use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+    let directory = temp_dir("badkey");
+    let encryption_key = [0x2b_u8; 16];
+    // 服务器给出的密钥与加密用的不是同一把：解密必然失败。
+    let served_key = [0x9e_u8; 16];
+    let iv = [0x7c_u8; 16];
+    let plaintext = ts_segment(6, 1);
+    let encrypted = Aes128CbcEnc::new(&encryption_key.into(), &iv.into())
+        .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+
+    // IV 由加密用的字节数组生成，避免手写字面量与加密时的 IV 不一致。
+    let iv_hex: String = iv.iter().map(|byte| format!("{byte:02x}")).collect();
+    let key_line = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"/key.bin\",IV=0x{iv_hex}");
+
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    routes.insert("/seg0.ts".to_string(), encrypted.clone().into());
+    routes.insert("/key.bin".to_string(), served_key.to_vec().into());
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 1, Some(&key_line)).into_bytes().into(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let result = run_download_result(
+        &directory,
+        &server.url("/video.m3u8"),
+        "badkey",
+        test_settings(),
+    )
+    .await;
+
+    // 不能带着损坏的成品「完成」，必须失败并报出真实原因。
+    let error = result.expect_err("密钥错误时任务应当失败");
+    assert!(
+        matches!(error, CoreError::UndecryptedSegments { count } if count == 1),
+        "错误类型不符：{error}"
+    );
+
+    let manifest = discover_task_manifests(&directory)
+        .into_iter()
+        .next()
+        .expect("任务 manifest 应留在磁盘上");
+    assert!(
+        !manifest.segment_path(0).is_file(),
+        "解密失败的分片不能写进正常分片路径，否则续传会把它当已完成"
+    );
+    assert!(
+        manifest.debug_path(0).is_file(),
+        "原始密文应归档到 _debug 供排查"
+    );
+    assert_eq!(
+        manifest.completed_segment_count().expect("统计分片失败"),
+        0,
+        "解密失败的分片不能计为已完成，否则续传会跳过它"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 合并要能响应取消。拼接在阻塞线程池里跑同步 IO，任务 abort 中断不了它，
+/// 只能靠循环里自查；中断后中间文件必须清干净，否则会被手动合并扫描当成正常分片。
+#[tokio::test]
+async fn cancelled_merge_stops_and_leaves_no_intermediate_files() {
+    let directory = temp_dir("cancel-merge");
+    let mut paths = Vec::new();
+    for index in 0..4 {
+        let path = directory.join(format!("seg{index}.ts"));
+        std::fs::write(&path, ts_segment(6, index as u8 + 1)).expect("写入分片失败");
+        paths.push(path);
+    }
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let result = merge_segments(&paths, None, &directory, "video", false, None, &token).await;
+
+    assert!(
+        matches!(result, Err(CoreError::Canceled)),
+        "取消后合并应立即停下：{result:?}"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&directory)
+        .expect("读取目录失败")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cat-catch-")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "取消后不应残留中间文件：{leftovers:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 密钥整体错误时每个分片都会解密失败，逐条记录会刷满日志面板，
+/// 只应保留前几条（对应 downloader 的 MAX_DECRYPT_ERROR_LOGS）再汇总一句。
+#[tokio::test]
+async fn undecrypted_segments_logs_only_first_few() {
+    use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+    let directory = temp_dir("badkey-logs");
+    let encryption_key = [0x2b_u8; 16];
+    let served_key = [0x9e_u8; 16];
+    let iv = [0x7c_u8; 16];
+    // 失败数要超过限流阈值，才看得出「超出后只汇总一次」。
+    let segment_count = 6;
+    let plaintexts: Vec<Vec<u8>> = (0..segment_count)
+        .map(|index| ts_segment(6, index as u8 + 1))
+        .collect();
+    let encrypted: Vec<Vec<u8>> = plaintexts
+        .iter()
+        .map(|data| {
+            Aes128CbcEnc::new(&encryption_key.into(), &iv.into())
+                .encrypt_padded_vec_mut::<Pkcs7>(data)
+        })
+        .collect();
+
+    let iv_hex: String = iv.iter().map(|byte| format!("{byte:02x}")).collect();
+    let key_line = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"/key.bin\",IV=0x{iv_hex}");
+
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for (index, data) in encrypted.iter().enumerate() {
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
+    }
+    routes.insert("/key.bin".to_string(), served_key.to_vec().into());
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", segment_count, Some(&key_line))
+            .into_bytes()
+            .into(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let (result, logs) = run_download_result_with_logs(
+        &directory,
+        &server.url("/video.m3u8"),
+        "badkey-logs",
+        test_settings(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(CoreError::UndecryptedSegments { count }) if count == segment_count),
+        "全部分片都该解密失败：{result:?}"
+    );
+    let detailed = logs
+        .iter()
+        .filter(|message| message.contains("解密失败："))
+        .count();
+    assert_eq!(detailed, 3, "逐条日志应限流到 3 条：{logs:?}");
+    assert!(
+        logs.iter()
+            .any(|message| message.contains("后续不再逐条记录")),
+        "超出限流后应补一条汇总：{logs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 #[tokio::test]
 async fn selects_highest_bandwidth_variant() {
     let directory = temp_dir("master");
@@ -504,22 +811,25 @@ async fn selects_highest_bandwidth_variant() {
     let low_segments: Vec<Vec<u8>> = (0..2).map(|_| ts_segment(6, 0x11)).collect();
     let high_segments: Vec<Vec<u8>> = (0..4).map(|_| ts_segment(6, 0x99)).collect();
 
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     for (index, data) in low_segments.iter().enumerate() {
-        routes.insert(format!("/low/seg{index}.ts"), data.clone());
+        routes.insert(format!("/low/seg{index}.ts"), data.clone().into());
     }
     for (index, data) in high_segments.iter().enumerate() {
-        routes.insert(format!("/high/seg{index}.ts"), data.clone());
+        routes.insert(format!("/high/seg{index}.ts"), data.clone().into());
     }
     routes.insert(
         "/low.m3u8".to_string(),
-        media_playlist("/low", 2, None).into_bytes(),
+        media_playlist("/low", 2, None).into_bytes().into(),
     );
     routes.insert(
         "/high.m3u8".to_string(),
-        media_playlist("/high", 4, None).into_bytes(),
+        media_playlist("/high", 4, None).into_bytes().into(),
     );
-    routes.insert("/master.m3u8".to_string(), master.as_bytes().to_vec());
+    routes.insert(
+        "/master.m3u8".to_string(),
+        master.as_bytes().to_vec().into(),
+    );
 
     let server = TestServer::start(routes).await;
     let snapshot = run_download(
@@ -545,14 +855,14 @@ async fn selects_highest_bandwidth_variant() {
 async fn skips_segments_already_on_disk() {
     let directory = temp_dir("resume");
     let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
-    let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
     // 只提供前两个分片：第三个若被重新请求就会 404，任务必然失败。
     for (index, data) in segments.iter().take(2).enumerate() {
-        routes.insert(format!("/seg{index}.ts"), data.clone());
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
     }
     routes.insert(
         "/video.m3u8".to_string(),
-        media_playlist("", 3, None).into_bytes(),
+        media_playlist("", 3, None).into_bytes().into(),
     );
 
     let server = TestServer::start(routes).await;
@@ -684,6 +994,128 @@ fn reset_after_directory_removed_manually() {
     assert!(
         manifest.manifest_path().is_file(),
         "目录被外部删除后重置也要重新落盘"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 分片请求先被 429 拒绝、重试后放行：覆盖 fetch_with_retries 的 429 分支
+/// 和 Retry-After 解析。Retry-After 设为 0 秒，避免测试被真实退避拖慢。
+#[tokio::test]
+async fn retries_segments_after_429() {
+    let directory = temp_dir("retry-429");
+    let segments: Vec<Vec<u8>> = (0..2).map(|index| ts_segment(6, index as u8 + 1)).collect();
+
+    let throttled = Arc::new(ScriptedRoute {
+        script: vec![
+            TestResponse {
+                status: 429,
+                body: Vec::new(),
+                retry_after: Some("0".to_string()),
+            },
+            TestResponse {
+                status: 429,
+                body: Vec::new(),
+                retry_after: Some("0".to_string()),
+            },
+        ],
+        fallback: TestResponse::ok(segments[0].clone()),
+        hits: AtomicUsize::new(0),
+    });
+
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    routes.insert(
+        "/seg0.ts".to_string(),
+        TestRoute::Scripted(throttled.clone()),
+    );
+    routes.insert("/seg1.ts".to_string(), segments[1].clone().into());
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 2, None).into_bytes().into(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let snapshot = run_download(
+        &directory,
+        &server.url("/video.m3u8"),
+        "video",
+        test_settings(),
+    )
+    .await;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(
+        std::fs::read(output_of(&snapshot)).expect("读取输出失败"),
+        flatten(&segments)
+    );
+    // 前两次是 429，第三次才成功；如果重试没生效，任务会在第一次 429 失败。
+    assert!(
+        throttled.hit_count() >= 3,
+        "应当重试到成功为止，实际请求次数：{}",
+        throttled.hit_count()
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 播放列表中间换 KEY：前两个分片用 key1，第三个改用 key2（第二个 EXT-X-KEY 行）。
+/// 验证解析层的 key rotation 和下载层按 URI 缓存 key 的路径。
+#[tokio::test]
+async fn rotates_keys_mid_playlist() {
+    use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+    let directory = temp_dir("key-rotation");
+    let key1 = [0x11_u8; 16];
+    let iv1 = [0x01_u8; 16];
+    let key2 = [0x22_u8; 16];
+    let iv2 = [0x02_u8; 16];
+    let plaintexts: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
+    let mut encrypted: Vec<Vec<u8>> = Vec::new();
+    for (index, data) in plaintexts.iter().enumerate() {
+        let (key, iv) = if index < 2 {
+            (&key1, &iv1)
+        } else {
+            (&key2, &iv2)
+        };
+        encrypted
+            .push(Aes128CbcEnc::new(key.into(), iv.into()).encrypt_padded_vec_mut::<Pkcs7>(data));
+    }
+
+    let iv1_hex: String = iv1.iter().map(|byte| format!("{byte:02x}")).collect();
+    let iv2_hex: String = iv2.iter().map(|byte| format!("{byte:02x}")).collect();
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"/key1.bin\",IV=0x{iv1_hex}\n#EXTINF:10.0,\n/seg0.ts\n#EXTINF:10.0,\n/seg1.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"/key2.bin\",IV=0x{iv2_hex}\n#EXTINF:10.0,\n/seg2.ts\n#EXT-X-ENDLIST\n"
+    );
+
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for (index, data) in encrypted.iter().enumerate() {
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
+    }
+    routes.insert("/key1.bin".to_string(), key1.to_vec().into());
+    routes.insert("/key2.bin".to_string(), key2.to_vec().into());
+    routes.insert("/video.m3u8".to_string(), playlist.into_bytes().into());
+
+    let server = TestServer::start(routes).await;
+    let snapshot = run_download(
+        &directory,
+        &server.url("/video.m3u8"),
+        "rotated",
+        test_settings(),
+    )
+    .await;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(
+        !snapshot.detail.contains("解密失败"),
+        "出现了解密失败：{}",
+        snapshot.detail
+    );
+    assert_eq!(
+        std::fs::read(output_of(&snapshot)).expect("读取输出失败"),
+        flatten(&plaintexts),
+        "中间换 key 后解密结果必须仍与明文拼接一致"
     );
 
     let _ = std::fs::remove_dir_all(&directory);

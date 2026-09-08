@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "cat-catch-assistant"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "arboard",
@@ -4235,7 +4235,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

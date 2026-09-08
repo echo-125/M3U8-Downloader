@@ -7,10 +7,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use tokio_util::sync::CancellationToken;
+
 use crate::core::{
     error::CoreError,
     format::{detect_format, SegmentFormat},
 };
+
+/// 合并中间文件名的前缀。扫描分片目录时按它排除中间文件，
+/// 因此改名必须同时改这里，否则中间文件会被当成正常分片扫进去。
+const TEMPORARY_FILE_PREFIX: &str = ".cat-catch-";
 
 /// 合并中间文件的唯一计数器：进程内递增，保证并发合并各拿各的后缀。
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +41,11 @@ pub struct MergeResult {
     pub message: String,
 }
 
+/// 拼接分片并按需重封装。
+///
+/// `cancellation_token` 用于让分钟级的拼接与 ffmpeg 能中途停下：
+/// 拼接在阻塞线程池里跑同步 IO，光靠 abort 任务中断不了它，必须在循环里自查。
+/// 取消一律返回 `CoreError::Canceled`，中间文件由调用方清理。
 pub async fn merge_segments(
     segment_paths: &[PathBuf],
     initialization: Option<&Path>,
@@ -42,10 +53,12 @@ pub async fn merge_segments(
     output_name: &str,
     convert_to_mp4: bool,
     ffmpeg_program: Option<&str>,
+    cancellation_token: &CancellationToken,
 ) -> Result<MergeResult, CoreError> {
     if segment_paths.is_empty() {
         return Err(CoreError::InvalidInput("没有可合并的分片".into()));
     }
+    check_not_cancelled(cancellation_token)?;
     tokio::fs::create_dir_all(output_directory)
         .await
         .map_err(|_| CoreError::Io("创建输出目录失败".into()))?;
@@ -64,8 +77,20 @@ pub async fn merge_segments(
             // 因 unique_output_path「先检查再使用」非原子而互相覆盖。
             let temporary_input = unique_temporary_path(output_directory, "merge", "ts");
             // 合并是大块同步 IO，必须放到阻塞线程池，否则会卡住整个任务管理循环。
-            if let Err(error) = concatenate(segment_paths, &temporary_input, None).await {
-                // 拼接失败时清掉临时中间文件，避免残留 `.cat-catch-merge-*.ts`。
+            // 拼接与随后的 ffmpeg 都可能跑几分钟，两步之间留一个取消检查点。
+            let concatenated = match concatenate(
+                segment_paths,
+                &temporary_input,
+                None,
+                cancellation_token,
+            )
+            .await
+            {
+                Ok(()) => check_not_cancelled(cancellation_token),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = concatenated {
+                // 拼接失败或中途取消时清掉临时中间文件，避免残留中间产物。
                 let _ = tokio::fs::remove_file(&temporary_input).await;
                 return Err(error);
             }
@@ -116,20 +141,26 @@ pub async fn merge_segments(
                     output_directory,
                     output_name,
                     ffmpeg_program,
+                    cancellation_token,
                 )
                 .await;
             };
             let output = unique_output_path(output_directory, output_name, "mp4");
             // raw 中间文件同样用唯一名，避免并发同名任务撞 raw.mp4。
             let raw_output = unique_temporary_path(output_directory, "merge-raw", "mp4");
-            if let Err(error) = concatenate(
+            let concatenated = match concatenate(
                 segment_paths,
                 &raw_output,
                 Some(initialization.to_path_buf()),
+                cancellation_token,
             )
             .await
             {
-                // 拼接失败时 raw 与 output 占位都在磁盘上，清理掉避免污染输出目录。
+                Ok(()) => check_not_cancelled(cancellation_token),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = concatenated {
+                // 拼接失败或中途取消时 raw 与 output 占位都在磁盘上，清理掉避免污染输出目录。
                 let _ = tokio::fs::remove_file(&raw_output).await;
                 let _ = tokio::fs::remove_file(&output).await;
                 return Err(error);
@@ -170,6 +201,7 @@ async fn concat_fmp4_segments(
     output_directory: &Path,
     output_name: &str,
     ffmpeg_program: Option<&str>,
+    cancellation_token: &CancellationToken,
 ) -> Result<MergeResult, CoreError> {
     let Some(program) = ffmpeg_program else {
         return Err(CoreError::InvalidInput(
@@ -198,6 +230,13 @@ async fn concat_fmp4_segments(
     if let Err(error) = write_result.map_err(|_| CoreError::Io("写入 concat 列表失败".into()))
     {
         // 还没开始合并，`output` 是空占位文件，清理掉。
+        let _ = tokio::fs::remove_file(&output).await;
+        let _ = tokio::fs::remove_file(&concat_list).await;
+        return Err(error);
+    }
+
+    // ffmpeg 之前的最后一个取消点：它跑起来就是分钟级，中途打断不了。
+    if let Err(error) = check_not_cancelled(cancellation_token) {
         let _ = tokio::fs::remove_file(&output).await;
         let _ = tokio::fs::remove_file(&concat_list).await;
         return Err(error);
@@ -232,7 +271,7 @@ fn unique_temporary_path(directory: &Path, prefix: &str, extension: &str) -> Pat
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     directory.join(format!(
-        ".cat-catch-{prefix}-{nanos}-{counter}-{pid}.{extension}",
+        "{TEMPORARY_FILE_PREFIX}{prefix}-{nanos}-{counter}-{pid}.{extension}",
         pid = id()
     ))
 }
@@ -285,6 +324,12 @@ pub async fn scan_merge_folder(folder: &Path) -> Result<MergeScanResult, CoreErr
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        if name.starts_with(TEMPORARY_FILE_PREFIX) {
+            // 合并中间文件带这个前缀，扩展名同样是 ts/mp4，放过去会被当成正常分片
+            // 混进合并结果。正常流程里它们会被 rename 掉，但同时有任务在合并时
+            // 扫描同一目录就会撞上。
+            continue;
+        }
         if name.eq_ignore_ascii_case("init.mp4") || name.eq_ignore_ascii_case("init.m4s") {
             result.initialization = Some(path);
             continue;
@@ -382,24 +427,40 @@ fn inspect_segment_format(path: &Path) -> Result<SegmentFormat, CoreError> {
     Ok(detect_format(&header[..read]))
 }
 
+/// 合并阶段的取消检查点。拼接在阻塞线程池里跑同步 IO，任务 abort 中断不了它，
+/// 只能靠循环里自查。
+fn check_not_cancelled(token: &CancellationToken) -> Result<(), CoreError> {
+    if token.is_cancelled() {
+        Err(CoreError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
 /// 在阻塞线程池中拼接分片，避免大文件合并卡住异步任务管理循环。
 async fn concatenate(
     paths: &[PathBuf],
     output: &Path,
     initialization: Option<PathBuf>,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), CoreError> {
     let paths = paths.to_vec();
     let output = output.to_path_buf();
+    let token = cancellation_token.clone();
     tokio::task::spawn_blocking(move || match initialization {
-        Some(initialization) => concatenate_fmp4(&paths, &initialization, &output),
-        None => concatenate_files(&paths, &output),
+        Some(initialization) => concatenate_fmp4(&paths, &initialization, &output, &token),
+        None => concatenate_files(&paths, &output, &token),
     })
     .await
     .unwrap_or(Err(CoreError::Io("合并任务异常终止".into())))
 }
 
 /// TS 拼接：丢弃首部可能混入的垃圾数据，从第一个合法的同步字节开始写。
-fn concatenate_files(paths: &[PathBuf], output: &Path) -> Result<(), CoreError> {
+fn concatenate_files(
+    paths: &[PathBuf],
+    output: &Path,
+    token: &CancellationToken,
+) -> Result<(), CoreError> {
     let mut writer =
         BufWriter::new(File::create(output).map_err(|_| CoreError::Io("创建合并文件失败".into()))?);
     let mut head = Vec::new();
@@ -414,6 +475,8 @@ fn concatenate_files(paths: &[PathBuf], output: &Path) -> Result<(), CoreError> 
             if read == 0 {
                 break;
             }
+            // 每个缓冲块检查一次：大文件拼接要跑很久，单靠 abort 停不下来。
+            check_not_cancelled(token)?;
             let chunk = &buffer[..read];
             if head_written {
                 write_chunk(&mut writer, chunk)?;
@@ -443,6 +506,7 @@ fn concatenate_fmp4(
     paths: &[PathBuf],
     initialization: &Path,
     output: &Path,
+    token: &CancellationToken,
 ) -> Result<(), CoreError> {
     let mut writer =
         BufWriter::new(File::create(output).map_err(|_| CoreError::Io("创建合并文件失败".into()))?);
@@ -450,6 +514,7 @@ fn concatenate_fmp4(
         File::open(initialization).map_err(|_| CoreError::Io("打开初始化段失败".into()))?;
     std::io::copy(&mut init, &mut writer).map_err(|_| CoreError::Io("写入初始化段失败".into()))?;
     for path in paths {
+        check_not_cancelled(token)?;
         let mut input = File::open(path).map_err(|_| CoreError::Io("打开分片失败".into()))?;
         copy_stripping_styp(&mut input, &mut writer)?;
     }

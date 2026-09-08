@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -120,27 +120,52 @@ pub struct LoggingGuard {
     _file: Option<Arc<Mutex<LogFile>>>,
 }
 
-/// 初始化日志；返回文件日志不可用时的警告（仅当请求了文件日志但打开失败时）。
+/// 初始化日志；返回需要用户知晓的警告（目录回退或完全不可用时）。
+///
+/// 日志目录由入口按「下载路径 / `.cat-catch-tasks` / logs」构造后传入——目录归属
+/// 下载路径是行为约定，但本模块不该知道任务目录的命名规则，只负责在给定目录里开文件。
+/// 目录在启动时确定一次，运行中改下载路径不影响已打开的日志文件，下次启动生效。
+///
+/// 请求目录打不开（网络盘未挂载、U 盘只读等）时回退到 exe 同目录的 `logs/`，
+/// 回退成功也返回提示，避免用户以为日志丢了；两次都失败才放弃文件日志。
 ///
 /// 发布版不挂控制台（windows_subsystem），文件日志打不开时 stdout 又是空转——
 /// 用户会完全无感知地失去所有日志。这里把警告带出来，由入口把它显示到 GUI 日志面板。
-pub fn init(config: &LoggingConfig) -> (LoggingGuard, Option<String>) {
+pub fn init(
+    config: &LoggingConfig,
+    requested_directory: PathBuf,
+) -> (LoggingGuard, Option<String>) {
+    let fallback_directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("logs");
+
+    let mut fell_back = false;
     let file = if config.file_enabled {
-        match LogFile::open(log_directory(), config) {
-            Some(file) => Some(Arc::new(Mutex::new(file))),
-            None => {
-                tracing::warn!("文件日志不可用：logs 目录或日志文件创建失败，日志仅保留在内存");
-                None
-            }
+        let opened = LogFile::open(requested_directory, config)
+            .or_else(|| {
+                fell_back = true;
+                LogFile::open(fallback_directory, config)
+            })
+            .map(|file| Arc::new(Mutex::new(file)));
+        if opened.is_none() {
+            tracing::warn!("文件日志不可用：日志目录创建失败，日志仅保留在内存");
         }
+        opened
     } else {
         None
     };
 
-    let warning = if config.file_enabled && file.is_none() {
-        Some("文件日志不可用：程序所在目录不可写，运行日志仅保留在本窗口的日志面板".to_string())
-    } else {
+    let warning = if !config.file_enabled || file.is_some() && !fell_back {
         None
+    } else if file.is_some() {
+        Some("下载路径不可写，日志已记录到程序目录下的 logs 文件夹".to_string())
+    } else {
+        Some(
+            "文件日志不可用：下载路径与程序目录均不可写，运行日志仅保留在本窗口的日志面板"
+                .to_string(),
+        )
     };
 
     match &file {
@@ -160,12 +185,4 @@ pub fn init(config: &LoggingConfig) -> (LoggingGuard, Option<String>) {
     }
 
     (LoggingGuard { _file: file }, warning)
-}
-
-fn log_directory() -> PathBuf {
-    let directory = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|path| path.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    directory.join("logs")
 }

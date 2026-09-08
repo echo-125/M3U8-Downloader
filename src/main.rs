@@ -12,7 +12,13 @@ use crate::config::Settings;
 
 fn main() -> eframe::Result {
     let (settings, mut warning) = Settings::load_or_default(None);
-    let (_logging_guard, logging_warning) = logging::init(&settings.logging);
+    // 日志随下载路径走：收在下载目录的 `.cat-catch-tasks/logs/` 里，下载目录只看到
+    // 一个隐藏式前缀目录。目录在启动时确定，运行中改下载路径要重启后才生效。
+    let log_directory = settings
+        .normalized_download_path()
+        .join(crate::core::task::TASK_DIRECTORY_NAME)
+        .join("logs");
+    let (_logging_guard, logging_warning) = logging::init(&settings.logging, log_directory);
     tracing::info!("应用启动");
     if let Some(message) = &logging_warning {
         // 文件日志打不开时用户没有任何渠道看到 warning：合并进配置警告一起显示。

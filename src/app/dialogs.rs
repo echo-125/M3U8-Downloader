@@ -390,6 +390,47 @@ pub fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
         });
 }
 
+/// 工具栏「删除」的二次确认。
+///
+/// 这个按钮无视勾选，会移除全部已结束（已完成 / 已失败 / 已取消）的任务并清掉
+/// 它们的临时分片目录，不可恢复。过去点了就直接执行，失败任务已下载的分片
+/// 一次点击就没了；这里补上与右键删除同级的确认。
+/// 文案刻意紧凑：主文案与副说明各一行，窗口不因换行被撑高。
+pub fn render_remove_finished_confirmation(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_remove_finished_confirmation {
+        return;
+    }
+    let finished = state
+        .tasks
+        .iter()
+        .filter(|task| !task.status.is_active())
+        .count();
+    egui::Window::new("删除任务")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(320.0)
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "确定要删除这 {finished} 个已结束（已完成/已失败/已取消）的任务吗？"
+            ));
+            ui.label(
+                RichText::new("会清理它们的临时分片目录，成品文件保留")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if danger_button(ui, "删除").clicked() {
+                    state.confirm_remove_finished();
+                }
+                if ui.button("取消").clicked() {
+                    state.cancel_remove_finished();
+                }
+            });
+        });
+}
+
 /// 删除任务前的二次确认。
 ///
 /// 删除会中断进行中的下载、清掉任务的临时分片目录且不可恢复；

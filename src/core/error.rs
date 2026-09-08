@@ -32,6 +32,8 @@ pub enum CoreError {
     InvalidKey,
     #[error("解密失败，可能密钥或 IV 不正确")]
     Decrypt,
+    #[error("{count} 个分片解密失败，可能密钥或 IV 不正确，原始密文已保存到 _debug 目录")]
+    UndecryptedSegments { count: usize },
     #[error("分片内容异常：{0}")]
     InvalidSegment(String),
     #[error("不支持的加密方式：{0}")]

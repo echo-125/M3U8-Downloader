@@ -107,15 +107,6 @@ pub enum ThemeKind {
     Dark,
 }
 
-impl ThemeKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Light => "亮色",
-            Self::Dark => "暗色",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub download_path: String,

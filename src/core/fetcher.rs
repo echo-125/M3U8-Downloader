@@ -4,6 +4,7 @@ use reqwest::Response;
 
 use crate::config::Settings;
 use crate::core::{
+    downloader::STALLED_TIMEOUT,
     error::CoreError,
     format::{diagnostic_message, error_detail, is_error_response},
     playlist::{parse_playlist, select_best_variant, MediaPlaylist, Playlist},
@@ -65,20 +66,13 @@ impl PlaylistFetcher {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(content_type_charset);
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| CoreError::Network("读取播放列表失败".into()))?;
+        let bytes = read_small_body(response).await?;
         Ok(decode_playlist(&bytes, charset.as_deref()))
     }
 
     pub async fn fetch_key(&self, url: &str) -> Result<Vec<u8>, CoreError> {
         let response = self.send(url, None).await?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|_| CoreError::Network("读取密钥失败".into()))
+        read_small_body(response).await
     }
 
     pub async fn send(&self, url: &str, range: Option<String>) -> Result<Response, CoreError> {
@@ -108,6 +102,17 @@ impl PlaylistFetcher {
         })?;
         Ok(response)
     }
+}
+
+/// 播放列表和密钥都是小文件，读取超过空闲超时直接判定连接卡死。
+/// 总超时（300s）是给大分片的慢传输兜底的，卡在这类小请求上不该陪它等那么久——
+/// 任务会停在「正在解析播放列表」好几分钟，看起来像挂了。
+async fn read_small_body(response: Response) -> Result<Vec<u8>, CoreError> {
+    let bytes = tokio::time::timeout(STALLED_TIMEOUT, response.bytes())
+        .await
+        .map_err(|_| CoreError::Timeout)?
+        .map_err(|_| CoreError::Network("读取响应失败".into()))?;
+    Ok(bytes.to_vec())
 }
 
 /// 播放列表解码：优先响应头声明的字符集，其次 UTF-8，最后回退中文站点常见编码。

@@ -99,6 +99,8 @@ pub struct AppState {
     pub exit_confirmation_count: usize,
     /// 清空任务列表前的二次确认弹窗。
     pub show_clear_confirmation: bool,
+    /// 工具栏「删除」的二次确认弹窗（删除所有已结束的任务）。
+    pub show_remove_finished_confirmation: bool,
     /// 关闭设置窗口时，若有未保存的修改则弹窗确认是否放弃。
     pub show_discard_settings_confirmation: bool,
     /// 删除任务前的二次确认弹窗。
@@ -135,7 +137,7 @@ impl AppState {
         manager.resume_tasks(resume_directories);
 
         let mut logs = LogBuffer::default();
-        logs.push_info("日志系统已就绪");
+        // 不写「日志系统已就绪」这类回声：面板只留错误、警告与任务结果。
         if let Some(warning) = load_warning {
             logs.push_warning(warning);
         }
@@ -170,6 +172,7 @@ impl AppState {
             show_exit_confirmation: false,
             exit_confirmation_count: 0,
             show_clear_confirmation: false,
+            show_remove_finished_confirmation: false,
             show_discard_settings_confirmation: false,
             show_delete_confirmation: false,
             pending_delete_ids: Vec::new(),
@@ -209,15 +212,17 @@ impl AppState {
                         CoreLogLevel::Error => LogLevel::Error,
                     };
                     // 单向桥接到文件日志：核心只走事件通道，若这里不转写，
-                    // 任务失败原因、合并结果这类信息就只留在界面日志里，文件日志查不到。
+                    // 任务失败原因这类信息就只留在界面日志里，文件日志查不到。
+                    // 文件日志只落错误与警告：Info 是流程回声，任务结果在界面直接可见，
+                    // 全量落盘只会稀释真正要排查的内容。
                     //
                     // 注意 tracing 的 writer 内部持有 LogFile 的互斥锁且不可重入，
                     // 因此 process_events 以及它调用的 logs 写入路径，
                     // 都不得再触发任何 tracing 调用，否则会自己锁死自己。
                     match level {
-                        LogLevel::Info => tracing::info!("{message}"),
                         LogLevel::Warning => tracing::warn!("{message}"),
                         LogLevel::Error => tracing::error!("{message}"),
+                        LogLevel::Info => {}
                     }
                     self.logs.push(level, message);
                 }
@@ -254,6 +259,7 @@ impl AppState {
                     if request_id == self.manual_request_id {
                         match result {
                             Ok(result) => {
+                                // 手动合并结果属于任务结果，保留在面板里供回查输出路径。
                                 self.logs.push_info(format!(
                                     "合并完成：{}",
                                     result.output_path.to_string_lossy()
@@ -268,10 +274,8 @@ impl AppState {
                     }
                 }
                 TaskEvent::FfmpegStatus { info } => match info {
-                    Some(info) => {
-                        self.ffmpeg_status = Some(info);
-                        self.logs.push_info("ffmpeg 检测成功");
-                    }
+                    // 检测成功是常态，状态栏已有版本号展示，不再写日志。
+                    Some(info) => self.ffmpeg_status = Some(info),
                     None => {
                         self.ffmpeg_status = None;
                         self.logs
@@ -297,15 +301,13 @@ impl AppState {
         self.manager
             .send(TaskCommand::UpdateSettings(self.settings.clone()));
         self.manager.send(TaskCommand::DetectFfmpeg);
-        self.logs.push_info("设置已保存");
-        // 保存后给出明确反馈，避免用户以为按钮没反应。
+        // 保存后给出明确反馈，避免用户以为按钮没反应。反馈走 Toast 不走日志。
         self.show_toast("设置已保存", false);
         true
     }
 
     pub fn reset_settings(&mut self) {
         self.settings = Settings::default();
-        self.logs.push_info("已恢复默认设置，请点击保存后生效");
     }
 
     /// 设置窗口里是否存在尚未保存的修改。
@@ -330,10 +332,7 @@ impl AppState {
         if let Err(error) = self.settings.save(Some(&self.config_path)) {
             self.logs.push_error(format!("主题保存失败：{error}"));
         }
-        self.logs.push_info(format!(
-            "已切换到{}主题",
-            self.settings.appearance.theme.label()
-        ));
+        // 切换结果界面上立即可见，不写日志。
     }
 
     pub fn add_single_task(&mut self) {
@@ -364,10 +363,11 @@ impl AppState {
         let text = self.batch_text.clone();
         let output_directory = self.output_directory();
         let max_workers = self.settings.max_workers;
-        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, true);
+        // 批量内容可能包含用户想先检查的链接，与「粘贴添加」一致不自动开始，
+        // 全部置为「等待中」由用户手动开始。
+        let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, false);
         if valid > 0 {
-            self.logs
-                .push_info(format!("批量添加完成：成功 {valid} 个"));
+            self.show_toast(format!("已批量添加 {valid} 个任务，等待手动开始"), false);
             self.batch_text.clear();
         }
         self.report_invalid_lines(&errors);
@@ -398,8 +398,7 @@ impl AppState {
             self.report_invalid_lines(&errors);
             return;
         }
-        self.logs
-            .push_info(format!("粘贴添加完成：成功 {valid} 个"));
+        self.show_toast(format!("已粘贴添加 {valid} 个任务，等待手动开始"), false);
         self.report_invalid_lines(&errors);
     }
 
@@ -467,7 +466,7 @@ impl AppState {
             request_id: self.manual_request_id,
             folder,
         });
-        self.logs.push_info("正在扫描合并文件夹");
+        // 扫描发起与结果都不写日志：结果直接展示在表单下方。
     }
 
     /// 文件夹路径改了就作废已展示的扫描结果。留着旧结果会让「开始合并」仍可点击，
@@ -502,7 +501,7 @@ impl AppState {
             output_name,
             convert_to_mp4: self.manual_convert_to_mp4,
         });
-        self.logs.push_info("正在合并分片");
+        // 合并发起不写日志，完成 / 失败时才记。
     }
 
     pub fn active_task_count(&self) -> usize {
@@ -634,13 +633,28 @@ impl AppState {
         ids_where(&self.pending_delete_ids, &self.tasks, TaskStatus::is_active).len()
     }
 
-    /// 工具栏「删除」：无视勾选，移除所有已完成与已失败的任务。
+    /// 工具栏「删除」：无视勾选，移除所有已结束（已完成 / 已失败 / 已取消）的任务。
     ///
     /// 会清掉这些任务的临时分片目录，`output_directory` 下的成品文件不受影响；
     /// 未完成任务被打上标记，重启后不再续传。要删除指定任务请用右键菜单，
-    /// 那条路径走 `delete_tasks` 并带二次确认。
+    /// 那条路径走 `delete_tasks` 并带二次确认。此语义为行为约定，不得收窄。
     pub fn remove_finished_tasks(&mut self) {
         self.manager.send(TaskCommand::RemoveFinished);
+    }
+
+    /// 请求删除所有已结束任务。这个按钮无视勾选，删掉的临时分片不可恢复，
+    /// 误触代价高，因此不直发命令，先弹确认。
+    pub fn request_remove_finished_confirmation(&mut self) {
+        self.show_remove_finished_confirmation = true;
+    }
+
+    pub fn confirm_remove_finished(&mut self) {
+        self.remove_finished_tasks();
+        self.show_remove_finished_confirmation = false;
+    }
+
+    pub fn cancel_remove_finished(&mut self) {
+        self.show_remove_finished_confirmation = false;
     }
 
     pub fn save_edited_task(&mut self) {
@@ -702,7 +716,7 @@ impl AppState {
         if !request_headers.is_empty() {
             self.single_headers = request_headers;
         }
-        self.logs.push_info("已从剪贴板粘贴链接");
+        // 粘贴结果输入框里立即可见，不写日志。
     }
 
     /// 保存配置但不写日志、不通知核心，用于窗口尺寸这类高频变更。

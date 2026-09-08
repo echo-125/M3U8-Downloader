@@ -13,7 +13,7 @@ use super::{
     dialogs::{
         render_clear_confirmation, render_delete_confirmation,
         render_discard_settings_confirmation, render_edit_window, render_exit_confirmation,
-        render_settings_window, render_toast,
+        render_remove_finished_confirmation, render_settings_window, render_toast,
     },
     forms::render_creation_area,
     state::AppState,
@@ -60,6 +60,7 @@ pub fn render(ctx: &egui::Context, state: &mut AppState) {
     render_edit_window(ctx, state);
     render_exit_confirmation(ctx, state);
     render_clear_confirmation(ctx, state);
+    render_remove_finished_confirmation(ctx, state);
     render_delete_confirmation(ctx, state);
     render_toast(ctx, state);
 }

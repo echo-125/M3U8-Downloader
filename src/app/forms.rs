@@ -1,6 +1,9 @@
 //! 新建任务区：单个任务、批量添加、手动合并三个标签页的表单。
+//!
+//! 三个标签页的高度刻意保持接近：批量输入框只给 3 行、手动合并的选项并入按钮行，
+//! 切换标签时卡片不跳动。要加控件行时先掂量整体高度，必要时压缩别处。
 
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use eframe::egui::{self, Align, Layout, RichText};
 
 use super::{
     state::{url_validation_hint, AppState, CreationTab},
@@ -10,6 +13,7 @@ use super::{
         path_dialog_string, primary_button, readonly_form_field, right_label, FORM_LABEL_WIDTH,
     },
 };
+use crate::core::events::TaskStatus;
 
 pub fn render_creation_area(ui: &mut egui::Ui, state: &mut AppState) {
     card(ui, "新建任务", |ui| {
@@ -113,7 +117,7 @@ fn render_batch_task_form(ui: &mut egui::Ui, state: &mut AppState) {
         "批量内容",
         &mut state.batch_text,
         "每行一条：链接|文件名|请求头JSON\nhttps://example.com/a.m3u8|视频名称|{}",
-        6,
+        3,
     );
 
     ui.add_space(2.0);
@@ -149,44 +153,50 @@ fn render_manual_merge_form(ui: &mut egui::Ui, state: &mut AppState) {
         "manual_merge",
         None,
     );
-    ui.horizontal(|ui| {
-        // 空标签占位，让勾选框与上方输入框左缘对齐。
-        right_label(ui, "", FORM_LABEL_WIDTH);
-        ui.checkbox(
-            &mut state.manual_convert_to_mp4,
-            "转换为 MP4（需要 ffmpeg）",
-        );
-    });
 
     ui.add_space(2.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let has_segments = state
-            .manual_scan
-            .as_ref()
-            .is_some_and(|scan| !scan.ts_segments.is_empty() || !scan.fmp4_segments.is_empty());
-        if primary_button(ui, has_segments, "开始合并").clicked() {
-            state.start_manual_merge();
-        }
-        if ui.button("扫描分片").clicked() {
-            state.scan_manual_folder();
-        }
+    // 勾选框与按钮同一行，避免单独占一行把手动合并页撑得比其他标签页高。
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.manual_convert_to_mp4, "转换为 MP4")
+            .on_hover_text("需要 ffmpeg；未检测到 ffmpeg 时输出 TS");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let has_segments = state
+                .manual_scan
+                .as_ref()
+                .is_some_and(|scan| !scan.ts_segments.is_empty() || !scan.fmp4_segments.is_empty());
+            if primary_button(ui, has_segments, "开始合并").clicked() {
+                state.start_manual_merge();
+            }
+            if ui.button("扫描分片").clicked() {
+                state.scan_manual_folder();
+            }
+        });
     });
+    // 扫描结果与异常提示合并为一行：fMP4 缺初始化段时整行转红，避免再多占一行。
     if let Some(scan) = &state.manual_scan {
-        ui.label(format!(
-            "扫描结果：TS {} 个，fMP4 {} 个，初始化段：{}",
+        let missing_init = !scan.fmp4_segments.is_empty() && scan.initialization.is_none();
+        let mut text = format!(
+            "TS {} 个，fMP4 {} 个，{}",
             scan.ts_segments.len(),
             scan.fmp4_segments.len(),
             if scan.initialization.is_some() {
-                "已找到"
+                "已找到初始化段"
             } else {
-                "未找到"
+                "未找到初始化段"
             }
-        ));
-        if !scan.fmp4_segments.is_empty() && scan.initialization.is_none() {
-            ui.label(
-                RichText::new("fMP4 合并需要初始化段（init.mp4）")
-                    .color(Color32::from_rgb(214, 69, 65)),
-            );
+        );
+        if missing_init {
+            text.push_str("；fMP4 缺少 init.mp4，无法合并");
         }
+        let text = RichText::new(text);
+        let text = if missing_init {
+            text.color(theme::status_color(
+                ui.ctx().style().visuals.dark_mode,
+                TaskStatus::Failed,
+            ))
+        } else {
+            text.weak()
+        };
+        ui.label(text);
     }
 }
