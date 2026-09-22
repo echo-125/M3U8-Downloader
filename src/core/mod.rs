@@ -10,6 +10,7 @@ pub mod format;
 pub mod headers;
 pub mod manager;
 pub mod merge;
+pub mod paste;
 pub mod playlist;
 pub mod proxy;
 pub mod retry;

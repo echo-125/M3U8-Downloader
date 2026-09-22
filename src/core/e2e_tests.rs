@@ -34,6 +34,7 @@ use crate::{
         events::{NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
         manager::TaskManager,
         merge::merge_segments,
+        paste::parse_inline_playlist,
         task::{discover_task_manifests, TaskManifest},
     },
 };
@@ -1194,6 +1195,7 @@ fn add_waiting_task(
         max_workers: 4,
         request_headers: String::new(),
         auto_start: false,
+        inline_playlist: None,
     }));
     let event = wait_for_event(manager, |event| matches!(event, TaskEvent::Snapshot(_)));
     let TaskEvent::Snapshot(snapshot) = event else {
@@ -1231,6 +1233,62 @@ fn remove_all_takes_waiting_tasks_and_deletes_segments() {
 
     assert_eq!(ids, vec![task_id], "等待中的任务必须一并被移除");
     wait_until("临时分片目录被清理", || !segment_path.exists());
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 浏览器导出的内联清单：清单正文随任务落盘，下载阶段不得再去请求清单地址。
+///
+/// 断言的核心是 `source_url` 指向服务器上并不存在的路径——若核心仍去回源抓清单，
+/// 这里必然以 404 失败；能合并出成品即证明走的是内联正文。
+#[tokio::test]
+async fn uses_inline_playlist_without_fetching_source_url() {
+    let directory = temp_dir("inline-playlist");
+    let segments: Vec<Vec<u8>> = (0..2).map(|index| ts_segment(6, index as u8 + 1)).collect();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for (index, data) in segments.iter().enumerate() {
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
+    }
+    let server = TestServer::start(routes).await;
+
+    // 卡片里的清单：分片是带签名的绝对地址，清单本身不再回源。
+    let content = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:8,\n{}\n#EXTINF:8,\n{}\n#EXT-X-ENDLIST\n",
+        server.url("/seg0.ts"),
+        server.url("/seg1.ts")
+    );
+    let playlist =
+        parse_inline_playlist(&content, &server.url("/seg0.ts")).expect("解析内联清单失败");
+
+    let mut manifest = TaskManifest::new(
+        1,
+        &server.url("/missing.m3u8"),
+        "video",
+        &directory,
+        4,
+        HashMap::new(),
+    )
+    .expect("创建任务失败");
+    manifest.playlist = Some(playlist);
+    manifest.save().expect("保存任务清单失败");
+
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    let task = DownloadTask {
+        manifest,
+        settings: test_settings(),
+        event_sender: sender,
+        cancellation_token: CancellationToken::new(),
+        global_permits: Arc::new(Semaphore::new(8)),
+    };
+    let snapshot = run_task(task).await.expect("任务执行失败");
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let output = std::fs::read(output_of(&snapshot)).expect("读取成品失败");
+    assert_eq!(
+        output,
+        flatten(&segments),
+        "成品内容必须来自内联清单里的分片"
+    );
 
     let _ = std::fs::remove_dir_all(&directory);
 }
@@ -1295,6 +1353,7 @@ fn remove_all_interrupts_downloading_task() {
         max_workers: 2,
         request_headers: String::new(),
         auto_start: true,
+        inline_playlist: None,
     }));
     // 等到真正进入下载状态，才能确保接下来打断的是一个进行中的任务。
     let event = wait_for_event(

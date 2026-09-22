@@ -67,6 +67,16 @@ pub enum CoreLogLevel {
     Error,
 }
 
+/// 浏览器导出的内联清单。
+///
+/// 正文与基准地址必须成对传递：核心要用**卡片自己的基准**去解析正文里的相对地址，
+/// 不能拿 `source_url` 顶替——后者优先取 referer（播放页），会把相对分片解析到错误目录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinePlaylist {
+    pub content: String,
+    pub base_url: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTask {
     pub source_url: String,
@@ -77,6 +87,9 @@ pub struct NewTask {
     /// 添加后是否立即开始下载。批量粘贴添加等需要人工确认的场景设为 false，
     /// 任务保持「等待中」，由用户手动开始。
     pub auto_start: bool,
+    /// 浏览器导出的内联清单。为 `Some` 时跳过清单抓取，直接以它作为任务清单——
+    /// 这类清单的地址带时效签名，回源通常已过期。
+    pub inline_playlist: Option<InlinePlaylist>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

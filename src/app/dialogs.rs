@@ -333,36 +333,106 @@ pub fn render_edit_window(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
+/// 确认弹窗里两个按钮的结果。
+enum ConfirmOutcome {
+    /// 本帧没有点任何按钮，弹窗保持打开。
+    Pending,
+    Confirmed,
+    Canceled,
+}
+
+/// 确认弹窗的内容配置。字段全是文案，用结构体而不是长参数列表，
+/// 避免调用点按位置传错——删除与清空两支的文案只差几个字。
+struct Confirmation<'a> {
+    title: &'a str,
+    question: &'a str,
+    /// 条件显示的危险提示行（如「其中 N 个正在进行」）。
+    warning: Option<String>,
+    /// 小字灰色的副说明。
+    note: Option<&'a str>,
+    confirm_label: &'a str,
+    cancel_label: &'a str,
+    /// 需要盖在设置窗口之上时置 true：二者同层，靠绘制顺序决定谁在上面。
+    foreground: bool,
+}
+
+/// 确认弹窗宽度固定，不交给内容推导。
+///
+/// 宽度由内容推导时，说明文字的折行位置会随窗口尺寸来回变化：折行改变内容高度，
+/// 高度又反过来影响可用宽度，弹窗逐帧抖动。各弹窗的说明长度接近，同一个宽度够用。
+const CONFIRM_WIDTH: f32 = 320.0;
+
+/// 渲染一个确认弹窗并返回用户的选择。
+fn danger_confirmation(ctx: &egui::Context, config: Confirmation<'_>) -> ConfirmOutcome {
+    let mut outcome = ConfirmOutcome::Pending;
+    let mut window = egui::Window::new(config.title);
+    if config.foreground {
+        window = window.order(Order::Foreground);
+    }
+    window
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .default_width(CONFIRM_WIDTH)
+        .show(ctx, |ui| {
+            ui.set_width(CONFIRM_WIDTH);
+            ui.label(RichText::new(config.question).strong());
+            if let Some(warning) = &config.warning {
+                let dark_mode = ctx.style().visuals.dark_mode;
+                ui.label(
+                    RichText::new(warning)
+                        .color(theme::status_color(dark_mode, TaskStatus::Failed)),
+                );
+            }
+            if let Some(note) = config.note {
+                ui.label(RichText::new(note).small().weak());
+            }
+            ui.add_space(12.0);
+            // 按钮行必须包在 horizontal 里：裸用 with_layout 会占满窗口剩余高度，
+            // Align::Center 再把整行垂直居中，弹窗就被撑出大片空白（与批量添加页同一个坑）。
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if danger_button(ui, config.confirm_label).clicked() {
+                        outcome = ConfirmOutcome::Confirmed;
+                    }
+                    if ui.button(config.cancel_label).clicked() {
+                        outcome = ConfirmOutcome::Canceled;
+                    }
+                });
+            });
+        });
+    outcome
+}
+
 pub fn render_exit_confirmation(ctx: &egui::Context, state: &mut AppState) {
     if !state.show_exit_confirmation {
         return;
     }
-    egui::Window::new("确认退出")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label(format!(
-                "当前有 {} 个任务仍在进行，确定要退出程序吗？",
-                state.exit_confirmation_count
-            ));
-            ui.label(
-                RichText::new("退出后正在下载的任务会被中断，进度会保留")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(12.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if danger_button(ui, "退出程序").clicked() {
-                    state.show_exit_confirmation = false;
-                    state.allow_exit = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
-                if ui.button("取消").clicked() {
-                    state.show_exit_confirmation = false;
-                }
-            });
-        });
+    let question = format!(
+        "当前有 {} 个任务仍在进行，确定要退出程序吗？",
+        state.exit_confirmation_count
+    );
+    let outcome = danger_confirmation(
+        ctx,
+        Confirmation {
+            title: "确认退出",
+            question: &question,
+            warning: None,
+            note: Some("退出后正在下载的任务会被中断，进度会保留"),
+            confirm_label: "退出程序",
+            cancel_label: "取消",
+            foreground: false,
+        },
+    );
+    match outcome {
+        ConfirmOutcome::Confirmed => {
+            state.show_exit_confirmation = false;
+            state.allow_exit = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        ConfirmOutcome::Canceled => state.show_exit_confirmation = false,
+        ConfirmOutcome::Pending => {}
+    }
 }
 
 /// 清空任务列表前的二次确认弹窗。
@@ -379,36 +449,26 @@ pub fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
         .iter()
         .filter(|task| task.status.is_active())
         .count();
-    egui::Window::new("清空任务列表")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(300.0)
-        .show(ctx, |ui| {
-            ui.label("确定要清空任务列表吗？将移除列表里的全部任务。");
-            if active > 0 {
-                let dark_mode = ctx.style().visuals.dark_mode;
-                ui.label(
-                    RichText::new(format!("其中 {active} 个正在进行，会中断下载"))
-                        .color(theme::status_color(dark_mode, TaskStatus::Failed)),
-                );
-            }
-            ui.label(
-                RichText::new("不删除任何本地文件，但任务本身无法恢复")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(12.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if danger_button(ui, "清空").clicked() {
-                    state.clear_all_tasks();
-                    state.show_clear_confirmation = false;
-                }
-                if ui.button("取消").clicked() {
-                    state.show_clear_confirmation = false;
-                }
-            });
-        });
+    let outcome = danger_confirmation(
+        ctx,
+        Confirmation {
+            title: "清空任务列表",
+            question: "确定要清空任务列表吗？将移除列表里的全部任务。",
+            warning: (active > 0).then(|| format!("其中 {active} 个正在进行，会中断下载")),
+            note: Some("不删除任何本地文件，但任务本身无法恢复"),
+            confirm_label: "清空",
+            cancel_label: "取消",
+            foreground: false,
+        },
+    );
+    match outcome {
+        ConfirmOutcome::Confirmed => {
+            state.clear_all_tasks();
+            state.show_clear_confirmation = false;
+        }
+        ConfirmOutcome::Canceled => state.show_clear_confirmation = false,
+        ConfirmOutcome::Pending => {}
+    }
 }
 
 /// 工具栏「删除」的二次确认。
@@ -426,39 +486,27 @@ pub fn render_remove_all_confirmation(ctx: &egui::Context, state: &mut AppState)
         .iter()
         .filter(|task| task.status.is_active())
         .count();
-    egui::Window::new("删除任务")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(320.0)
-        .show(ctx, |ui| {
-            ui.label(format!("确定要删除这 {total} 个任务吗？"));
-            if active > 0 {
-                let dark_mode = ctx.style().visuals.dark_mode;
-                ui.label(
-                    RichText::new(format!(
-                        "其中 {active} 个正在进行，会中断下载并删除已下载的分片"
-                    ))
-                    .color(theme::status_color(dark_mode, TaskStatus::Failed)),
-                );
-            }
+    let question = format!("确定要删除这 {total} 个任务吗？");
+    let outcome = danger_confirmation(
+        ctx,
+        Confirmation {
+            title: "删除任务",
+            question: &question,
+            warning: (active > 0)
+                .then(|| format!("其中 {active} 个正在进行，会中断下载并删除已下载的分片")),
             // 「清理临时分片目录」是「删除」与「清空」的核心区别，不能只在有进行中任务时
             // 才说：全是已完成任务时，用户看到成品不删、却不知道分片会被清掉。
-            ui.label(
-                RichText::new("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(12.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if danger_button(ui, "删除").clicked() {
-                    state.confirm_remove_all();
-                }
-                if ui.button("取消").clicked() {
-                    state.cancel_remove_all();
-                }
-            });
-        });
+            note: Some("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复"),
+            confirm_label: "删除",
+            cancel_label: "取消",
+            foreground: false,
+        },
+    );
+    match outcome {
+        ConfirmOutcome::Confirmed => state.confirm_remove_all(),
+        ConfirmOutcome::Canceled => state.cancel_remove_all(),
+        ConfirmOutcome::Pending => {}
+    }
 }
 
 /// 删除任务前的二次确认。
@@ -471,38 +519,27 @@ pub fn render_delete_confirmation(ctx: &egui::Context, state: &mut AppState) {
     }
     let total = state.pending_delete_ids.len();
     let active = state.pending_delete_active_count();
-    egui::Window::new("删除任务")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label(format!("确定要删除这 {total} 个任务吗？"));
-            if active > 0 {
-                let dark_mode = ctx.style().visuals.dark_mode;
-                ui.label(
-                    RichText::new(format!(
-                        "其中 {active} 个正在进行，会中断下载并删除已下载的分片"
-                    ))
-                    .color(theme::status_color(dark_mode, TaskStatus::Failed)),
-                );
-            }
+    let question = format!("确定要删除这 {total} 个任务吗？");
+    let outcome = danger_confirmation(
+        ctx,
+        Confirmation {
+            title: "删除任务",
+            question: &question,
+            warning: (active > 0)
+                .then(|| format!("其中 {active} 个正在进行，会中断下载并删除已下载的分片")),
             // 「清理临时分片目录」是「删除」与「清空」的核心区别，不能只在有进行中任务时
             // 才说：全是已完成任务时，用户看到成品不删、却不知道分片会被清掉。
-            ui.label(
-                RichText::new("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(12.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if danger_button(ui, "删除").clicked() {
-                    state.confirm_delete_pending();
-                }
-                if ui.button("取消").clicked() {
-                    state.cancel_delete_pending();
-                }
-            });
-        });
+            note: Some("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复"),
+            confirm_label: "删除",
+            cancel_label: "取消",
+            foreground: false,
+        },
+    );
+    match outcome {
+        ConfirmOutcome::Confirmed => state.confirm_delete_pending(),
+        ConfirmOutcome::Canceled => state.cancel_delete_pending(),
+        ConfirmOutcome::Pending => {}
+    }
 }
 
 /// 关闭设置窗口时的确认：未保存的修改会被丢弃，必须让用户知道并给「继续编辑」的出口。
@@ -510,24 +547,24 @@ pub fn render_discard_settings_confirmation(ctx: &egui::Context, state: &mut App
     if !state.show_discard_settings_confirmation {
         return;
     }
-    egui::Window::new("放弃修改")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        // 与设置窗口同层，靠绘制顺序（本函数在设置窗口之后调用）盖在遮罩之上。
-        .order(Order::Foreground)
-        .show(ctx, |ui| {
-            ui.label("设置已修改但尚未保存，关闭后会丢失这些修改。");
-            ui.add_space(12.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if danger_button(ui, "放弃修改").clicked() {
-                    state.discard_settings_edit();
-                }
-                if ui.button("继续编辑").clicked() {
-                    state.show_discard_settings_confirmation = false;
-                }
-            });
-        });
+    let outcome = danger_confirmation(
+        ctx,
+        Confirmation {
+            title: "放弃修改",
+            question: "设置已修改但尚未保存，关闭后会丢失这些修改。",
+            warning: None,
+            note: None,
+            confirm_label: "放弃修改",
+            cancel_label: "继续编辑",
+            // 与设置窗口同层，靠绘制顺序（本函数在设置窗口之后调用）盖在遮罩之上。
+            foreground: true,
+        },
+    );
+    match outcome {
+        ConfirmOutcome::Confirmed => state.discard_settings_edit(),
+        ConfirmOutcome::Canceled => state.show_discard_settings_confirmation = false,
+        ConfirmOutcome::Pending => {}
+    }
 }
 
 pub fn render_toast(ctx: &egui::Context, state: &mut AppState) {

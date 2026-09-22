@@ -11,9 +11,12 @@ use super::widgets::path_dialog_string;
 use crate::{
     config::{default_config_path, ProxyScheme, Settings, ThemeKind},
     core::{
-        events::{CoreLogLevel, NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
+        events::{
+            CoreLogLevel, InlinePlaylist, NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus,
+        },
         manager::TaskManager,
         merge::{sanitize_filename, MergeScanResult},
+        paste::{card_base_url, card_source_url, contains_card, parse_cards},
         task::{TaskRegistry, TASK_REGISTRY_FILE_NAME},
     },
     ffmpeg::FfmpegInfo,
@@ -354,6 +357,7 @@ impl AppState {
             max_workers: self.single_workers.clamp(1, 64),
             request_headers: self.single_headers.trim().to_string(),
             auto_start: true,
+            inline_playlist: None,
         }));
         self.single_url.clear();
         self.single_name.clear();
@@ -392,7 +396,7 @@ impl AppState {
         let (valid, errors) = self.add_tasks_from_text(&text, output_directory, max_workers, false);
         if valid == 0 {
             self.show_toast(
-                "粘贴添加失败：剪贴板中没有符合格式的内容\n格式为 链接|文件名 或 链接|文件名|请求头JSON",
+                "粘贴添加失败：剪贴板中没有符合格式的内容\n支持 链接|文件名|请求头JSON，以及浏览器导出的 M3U8 任务卡片",
                 true,
             );
             self.report_invalid_lines(&errors);
@@ -411,6 +415,10 @@ impl AppState {
         max_workers: usize,
         auto_start: bool,
     ) -> (usize, Vec<String>) {
+        // 任务卡片是多行 JSON，逐行解析必然失败，先整体分流。
+        if contains_card(text) {
+            return self.add_tasks_from_cards(text, output_directory, max_workers);
+        }
         let mut valid = 0;
         let mut errors = Vec::new();
         for (index, line) in text.lines().enumerate() {
@@ -434,6 +442,65 @@ impl AppState {
                 max_workers,
                 request_headers,
                 auto_start,
+                inline_playlist: None,
+            }));
+            valid += 1;
+        }
+        (valid, errors)
+    }
+
+    /// 解析浏览器导出的 M3U8 任务卡片并下发添加命令。
+    ///
+    /// 卡片里的清单正文是整段文本，表单既装不下也没法人工校对，因此这里直接建任务，
+    /// 不经过「链接|文件名|请求头」那条逐行路径。
+    ///
+    /// 卡片一律不自动开始：粘贴时的预期是看看内容，顺手触发下载并不合适。
+    fn add_tasks_from_cards(
+        &mut self,
+        text: &str,
+        output_directory: PathBuf,
+        max_workers: usize,
+    ) -> (usize, Vec<String>) {
+        let cards = match parse_cards(text) {
+            Ok(cards) => cards,
+            Err(error) => return (0, vec![error.user_message()]),
+        };
+        let mut valid = 0;
+        let mut errors = Vec::new();
+        for (index, card) in cards.into_iter().enumerate() {
+            let position = index + 1;
+            // 基准地址决定相对分片链接能否解析正确，取不到就不猜，跳过并如实报给用户。
+            let Some(base_url) = card_base_url(&card.content, &card.headers) else {
+                errors.push(format!(
+                    "第 {position} 个任务卡片：找不到可用的基准地址，无法解析分片链接"
+                ));
+                continue;
+            };
+            let request_headers = match serde_json::to_string(&card.headers) {
+                Ok(text) => text,
+                Err(_) => {
+                    errors.push(format!("第 {position} 个任务卡片：请求头无法序列化"));
+                    continue;
+                }
+            };
+            let output_name = if card.title.is_empty() {
+                derive_output_name(&base_url)
+            } else {
+                sanitize_filename(&card.title)
+            };
+            self.manager.send(TaskCommand::Add(NewTask {
+                source_url: card_source_url(&card.headers, &base_url),
+                output_name,
+                output_directory: output_directory.clone(),
+                max_workers,
+                request_headers,
+                auto_start: false,
+                // 解析基准必须显式传给核心：source_url 优先是 referer（播放页），
+                // 核心若拿它当基准，正文里的相对分片会被解析到播放页目录下。
+                inline_playlist: Some(InlinePlaylist {
+                    content: card.content,
+                    base_url,
+                }),
             }));
             valid += 1;
         }
@@ -446,11 +513,12 @@ impl AppState {
         if errors.is_empty() {
             return;
         }
-        let mut message = format!("有 {} 行格式不正确，已跳过", errors.len());
+        // 「项」而非「行」：卡片路径的报错单位是第几个卡片，逐行路径才是第几行。
+        let mut message = format!("有 {} 项格式不正确，已跳过", errors.len());
         let shown = errors.len().min(3);
         message.push_str(&format!("：\n{}", errors[..shown].join("\n")));
         if errors.len() > shown {
-            message.push_str(&format!("\n……另有 {} 行未显示", errors.len() - shown));
+            message.push_str(&format!("\n……另有 {} 项未显示", errors.len() - shown));
         }
         self.show_toast(message, true);
     }
@@ -699,6 +767,21 @@ impl AppState {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             self.show_toast("粘贴失败：剪贴板为空", true);
+            return;
+        }
+        // 任务卡片装不进表单（清单正文是整段文本），改为直接建任务并保持「等待中」：
+        // 用户点「粘贴」的预期是看看内容，不该顺手触发下载。
+        if contains_card(trimmed) {
+            let output_directory = self.output_directory();
+            let max_workers = self.single_workers.clamp(1, 64);
+            let (valid, errors) = self.add_tasks_from_cards(trimmed, output_directory, max_workers);
+            if valid > 0 {
+                self.show_toast(
+                    format!("已识别 M3U8 任务卡片，添加 {valid} 个任务，等待手动开始"),
+                    false,
+                );
+            }
+            self.report_invalid_lines(&errors);
             return;
         }
         let (source_url, output_name, request_headers) = match parse_task_line(trimmed) {

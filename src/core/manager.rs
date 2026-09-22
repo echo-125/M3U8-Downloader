@@ -230,8 +230,25 @@ fn add_task(state: &ManagerState, new_task: NewTask) {
             return;
         }
     };
+    // 内联清单先解析再建任务目录：解析失败时不必留下半成品目录。
+    // 基准地址取卡片自己的 base_url，而不是 source_url——后者优先是播放页，会把相对分片解析错。
+    let inline_playlist =
+        match new_task.inline_playlist.as_ref().map(|inline| {
+            crate::core::paste::parse_inline_playlist(&inline.content, &inline.base_url)
+        }) {
+            Some(Ok(playlist)) => Some(playlist),
+            Some(Err(error)) => {
+                send_log_and_toast(
+                    &state.event_sender,
+                    CoreLogLevel::Error,
+                    format!("任务添加失败：{}", error.user_message()),
+                );
+                return;
+            }
+            None => None,
+        };
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
-    let manifest = match TaskManifest::new(
+    let mut manifest = match TaskManifest::new(
         id,
         &new_task.source_url,
         &new_task.output_name,
@@ -249,6 +266,20 @@ fn add_task(state: &ManagerState, new_task: NewTask) {
             return;
         }
     };
+    if let Some(playlist) = inline_playlist {
+        manifest.playlist = Some(playlist);
+        if let Err(error) = manifest.save() {
+            // 任务没能登记，磁盘上这份目录会在下次启动时被扫描成一个「用户从没添加过」的任务，
+            // 顺手清掉。清理失败也只能作罢——save 失败通常就是磁盘已经写不进去了。
+            let _ = safe_remove_directory(&manifest.task_directory());
+            send_log_and_toast(
+                &state.event_sender,
+                CoreLogLevel::Error,
+                format!("任务添加失败：{}", error.user_message()),
+            );
+            return;
+        }
+    }
     if let Err(error) =
         TaskRegistry::register(&state.task_registry_path, &manifest.output_directory)
     {
