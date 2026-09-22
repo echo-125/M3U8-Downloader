@@ -1,6 +1,8 @@
-# M3U8下载器
-
-用 Rust 重写的 M3U8 视频下载器，Windows 桌面图形界面，发布形态为便携版单 exe。
+<div align="center">
+  <img src="assets/icon-256.png" width="140" alt="M3U8 下载器图标" />
+  <h1>M3U8下载器</h1>
+  <p>用 Rust 重写的 M3U8 视频下载器 · Windows 桌面图形界面 · 便携版单 exe</p>
+</div>
 
 本项目由 Python 版完全重构而来，目标是在保持功能等价的前提下降低内存占用、提升启动速度与运行稳定性。
 
