@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
+    time::Duration,
 };
 
 use tokio::{
@@ -88,6 +89,13 @@ impl TaskManager {
     }
 }
 
+/// 移除任务后等待协程退出的总预算。`abort` 只是打标记，协程要跑到下一个取消点才结束；
+/// 卡在不可取消的阻塞 IO（合并、ffmpeg）上的协程不会因此提前停下，所以等待必须有上限。
+const STOP_GRACE: Duration = Duration::from_millis(500);
+/// 等待协程退出时的轮询间隔：`JoinHandle` 没有借用形式的 `Future` 实现，
+/// 不能在保留所有权的情形下 join，只能轮询其完成标志。
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 #[derive(Debug)]
 struct TaskRuntime {
     manifest: TaskManifest,
@@ -150,7 +158,7 @@ async fn manager_loop(
             }
             TaskCommand::Retry(id) => start_task(&state, id).await,
             TaskCommand::Delete(id) => delete_task(&state, id).await,
-            TaskCommand::RemoveFinished => remove_finished_tasks(&state).await,
+            TaskCommand::RemoveAll => remove_all_tasks(&state).await,
             TaskCommand::EditTask {
                 id,
                 source_url,
@@ -168,7 +176,7 @@ async fn manager_loop(
                 )
                 .await
             }
-            TaskCommand::ClearFinished => clear_finished_tasks(&state).await,
+            TaskCommand::ClearAll => clear_all_tasks(&state).await,
             TaskCommand::ResumeTasks(directories) => resume_tasks(&state, directories),
             TaskCommand::UpdateSettings(new_settings) => update_settings(&state, new_settings),
             TaskCommand::DetectFfmpeg => {
@@ -581,36 +589,66 @@ async fn reset_task(state: &ManagerState, id: u64) {
     register_idle_task(state, manifest, snapshot);
 }
 
-/// 停止已移除任务的协程。只下发取消并标记 abort，不等待结束，可同步调用。
-fn stop_removed(removed: &[TaskRuntime]) {
+/// 停止已移除任务的协程，并有限等待它们真正退出。
+///
+/// 之所以要等：紧随其后就是删临时目录，而 abort 只打标记，协程跑到下一个取消点才释放
+/// 文件句柄。Windows 上正在写的文件删不掉，早一步删就只剩一条「清理失败」警告和残留目录。
+/// 之所以不能无限等：卡在合并、ffmpeg 这类不可取消的阻塞 IO 上的协程不会因 abort 提前
+/// 结束，等待必须到点就让路，剩下的由删除失败时的警告兜底。
+///
+/// 注意这段等待**没有被自动化测试覆盖**：现有用例把任务停在「已收到响应头、正在读响应体」
+/// 这一刻，此时分片尚未写盘，不存在被占用的文件句柄，所以把 `STOP_GRACE` 改成 0 测试依然
+/// 全过。删掉等待要靠真实的大文件下载场景才能复现出问题，别因为测试是绿的就动这里。
+async fn stop_removed(removed: &[TaskRuntime]) {
     for runtime in removed {
         runtime.cancellation_token.cancel();
         runtime.handle.abort();
     }
+    let _ = tokio::time::timeout(STOP_GRACE, wait_until_finished(removed)).await;
 }
 
-/// 已移除任务的收尾：给未完成任务打 dismissed 标记，可选清理临时目录。
+/// 轮询等待全部协程结束。
+async fn wait_until_finished(removed: &[TaskRuntime]) {
+    while !removed.iter().all(|runtime| runtime.handle.is_finished()) {
+        tokio::time::sleep(STOP_POLL_INTERVAL).await;
+    }
+}
+
+/// 给未完成任务打 dismissed 标记，避免重启后被断点续传重新载入。
 ///
-/// 两者都是同步文件 IO，临时目录可能有几个 GB。删除命令是在管理循环里处理的，
-/// 同步执行会占住 worker 线程，让所有任务的事件处理跟着一起停摆，因此必须放进
-/// 阻塞线程池。
+/// 与删目录分成两个函数，是因为两者耗时差几个数量级：打标记只写一个小文件，
+/// 删目录可能是几 GB。拆开后调用方可以在两者之间先把 `TasksRemoved` 发出去，
+/// 让界面立刻移除任务行，不必陪着删文件一起卡住。
 ///
-/// 顺序不能反：先打标记再删目录。目录被占用删不掉时，manifest 若没标记，
-/// 重启后任务会「死而复生」。
-async fn finalize_removed(removed: Vec<TaskRuntime>, remove_directory: bool) -> Vec<String> {
+/// 两步的顺序不能反：先打标记再删目录。目录被占用删不掉时，manifest 若没标记，
+/// 重启后任务会「死而复生」。注意这里是在副本上打标记——函数只借用任务，
+/// 删目录那一步还要用原来的所有权。
+async fn mark_removed_dismissed(removed: &[TaskRuntime]) -> Vec<String> {
+    let mut manifests: Vec<TaskManifest> = removed
+        .iter()
+        .map(|runtime| runtime.manifest.clone())
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+        for manifest in manifests.iter_mut().filter(|manifest| !manifest.completed) {
+            if let Err(error) = manifest.mark_dismissed() {
+                warnings.push(format!("标记已移除任务失败：{}", error.user_message()));
+            }
+        }
+        warnings
+    })
+    .await
+    .unwrap_or_else(|_| vec!["标记已移除任务失败：收尾协程异常终止".to_string()])
+}
+
+/// 清理已移除任务的临时目录。临时目录可能有几个 GB，同步删除放在管理循环里
+/// 会让所有任务的事件处理跟着停摆，必须放进阻塞线程池。
+async fn remove_removed_directories(removed: Vec<TaskRuntime>) -> Vec<String> {
     tokio::task::spawn_blocking(move || {
         let mut warnings = Vec::new();
         for runtime in removed {
-            let mut manifest = runtime.manifest;
-            if !manifest.completed {
-                if let Err(error) = manifest.mark_dismissed() {
-                    warnings.push(format!("标记已删除任务失败：{}", error.user_message()));
-                }
-            }
-            if remove_directory {
-                if let Err(error) = safe_remove_directory(&manifest.task_directory()) {
-                    warnings.push(format!("清理任务临时文件失败：{}", error.user_message()));
-                }
+            if let Err(error) = safe_remove_directory(&runtime.manifest.task_directory()) {
+                warnings.push(format!("清理任务临时文件失败：{}", error.user_message()));
             }
         }
         warnings
@@ -628,32 +666,29 @@ fn emit_warnings(state: &ManagerState, warnings: Vec<String>) {
     }
 }
 
-/// 移除所有已结束的任务（界面「删除」按钮，无视勾选）。
+/// 移除所有任务（界面「删除」按钮，无视勾选），含等待中与进行中。
 ///
-/// 「已结束」= 已完成 / 已失败 / 已取消，即所有非进行中的任务。这个语义是用户
-/// 拍板的行为约定（见 AGENTS.md 与 README），不得收窄回「仅已完成与已失败」。
+/// 进行中的先停止再收尾，未完成任务打上 dismissed 标记，避免重启后作为断点续传复活。
 /// 与「清空」的分工：本函数会清理临时分片目录，清空只移出列表不删文件。
-async fn remove_finished_tasks(state: &ManagerState) {
+/// 此语义为用户拍板的行为约定（见 AGENTS.md 与 README），不得收窄回「仅已结束任务」。
+async fn remove_all_tasks(state: &ManagerState) {
     let removed: Vec<TaskRuntime> = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
         };
-        let finished: Vec<u64> = tasks
-            .values()
-            .filter(|runtime| !runtime.snapshot.status.is_active())
-            .map(|runtime| runtime.manifest.id)
-            .collect();
-        finished.iter().filter_map(|id| tasks.remove(id)).collect()
+        std::mem::take(&mut *tasks).into_values().collect()
     };
     if removed.is_empty() {
         return;
     }
     let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
-    stop_removed(&removed);
-    // 未完成的（失败 / 取消）任务要打标记，避免重启后作为断点续传重新载入；
-    // 同时清掉临时分片目录。两步都是同步 IO，走阻塞线程池。
-    emit_warnings(state, finalize_removed(removed, true).await);
+    stop_removed(&removed).await;
+    // 未完成任务（含等待中、进行中、失败、取消）都要打 dismissed 标记，避免重启后
+    // 作为断点续传复活。标记一落地就通知界面移除行：删目录可能要花很久，
+    // 用户不该盯着一个毫无反应的列表等它结束。
+    emit_warnings(state, mark_removed_dismissed(&removed).await);
     let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
+    emit_warnings(state, remove_removed_directories(removed).await);
 }
 
 async fn delete_task(state: &ManagerState, id: u64) {
@@ -669,15 +704,19 @@ async fn delete_task(state: &ManagerState, id: u64) {
             .send(TaskEvent::TasksRemoved { ids: vec![id] });
         return;
     };
-    stop_removed(std::slice::from_ref(&runtime));
+    stop_removed(std::slice::from_ref(&runtime)).await;
     // 先打 dismissed 标记再删目录。反过来做的话，一旦目录被占用删不掉，
     // manifest 还在且没有标记，重启后任务会「死而复生」。
-    // 两步都是同步 IO，走阻塞线程池。
-    emit_warnings(state, finalize_removed(vec![runtime], true).await);
+    // 标记完成后立刻发事件，删目录的耗时不必让用户等着。
+    emit_warnings(
+        state,
+        mark_removed_dismissed(std::slice::from_ref(&runtime)).await,
+    );
     // 删除动作不写日志：TasksRemoved 事件已让界面移除对应行，写入 Info 只会稀释错误。
     let _ = state
         .event_sender
         .send(TaskEvent::TasksRemoved { ids: vec![id] });
+    emit_warnings(state, remove_removed_directories(vec![runtime]).await);
 }
 
 async fn edit_task(
@@ -872,28 +911,23 @@ fn copy_directory(from: &Path, to: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// 清除所有已结束的任务（已完成、已失败、已取消）。
+/// 清除所有任务（界面「清空」按钮，无视勾选），含等待中与进行中。
 /// 只把任务从列表移除并打 dismissed 标记，不删任何本地文件。
-async fn clear_finished_tasks(state: &ManagerState) {
+async fn clear_all_tasks(state: &ManagerState) {
     let removed: Vec<TaskRuntime> = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
         };
-        let finished: Vec<u64> = tasks
-            .values()
-            .filter(|runtime| !runtime.snapshot.status.is_active())
-            .map(|runtime| runtime.manifest.id)
-            .collect();
-        finished.iter().filter_map(|id| tasks.remove(id)).collect()
+        std::mem::take(&mut *tasks).into_values().collect()
     };
     if removed.is_empty() {
         return;
     }
     let ids: Vec<u64> = removed.iter().map(|runtime| runtime.manifest.id).collect();
-    stop_removed(&removed);
+    stop_removed(&removed).await;
     // 未完成的任务被清除后要打标记，否则重启后会被断点续传重新载入。
     // 清除动作不写日志：TasksRemoved 事件已驱动界面移除对应行。
-    emit_warnings(state, finalize_removed(removed, false).await);
+    emit_warnings(state, mark_removed_dismissed(&removed).await);
     let _ = state.event_sender.send(TaskEvent::TasksRemoved { ids });
 }
 

@@ -99,8 +99,8 @@ pub struct AppState {
     pub exit_confirmation_count: usize,
     /// 清空任务列表前的二次确认弹窗。
     pub show_clear_confirmation: bool,
-    /// 工具栏「删除」的二次确认弹窗（删除所有已结束的任务）。
-    pub show_remove_finished_confirmation: bool,
+    /// 工具栏「删除」的二次确认弹窗（删除所有任务，含进行中）。
+    pub show_remove_all_confirmation: bool,
     /// 关闭设置窗口时，若有未保存的修改则弹窗确认是否放弃。
     pub show_discard_settings_confirmation: bool,
     /// 删除任务前的二次确认弹窗。
@@ -172,7 +172,7 @@ impl AppState {
             show_exit_confirmation: false,
             exit_confirmation_count: 0,
             show_clear_confirmation: false,
-            show_remove_finished_confirmation: false,
+            show_remove_all_confirmation: false,
             show_discard_settings_confirmation: false,
             show_delete_confirmation: false,
             pending_delete_ids: Vec::new(),
@@ -633,28 +633,28 @@ impl AppState {
         ids_where(&self.pending_delete_ids, &self.tasks, TaskStatus::is_active).len()
     }
 
-    /// 工具栏「删除」：无视勾选，移除所有已结束（已完成 / 已失败 / 已取消）的任务。
+    /// 工具栏「删除」：无视勾选，移除所有任务（含等待中与进行中）。
     ///
     /// 会清掉这些任务的临时分片目录，`output_directory` 下的成品文件不受影响；
     /// 未完成任务被打上标记，重启后不再续传。要删除指定任务请用右键菜单，
     /// 那条路径走 `delete_tasks` 并带二次确认。此语义为行为约定，不得收窄。
-    pub fn remove_finished_tasks(&mut self) {
-        self.manager.send(TaskCommand::RemoveFinished);
+    pub fn remove_all_tasks(&mut self) {
+        self.manager.send(TaskCommand::RemoveAll);
     }
 
-    /// 请求删除所有已结束任务。这个按钮无视勾选，删掉的临时分片不可恢复，
+    /// 请求删除所有任务。这个按钮无视勾选，删掉的临时分片不可恢复，
     /// 误触代价高，因此不直发命令，先弹确认。
-    pub fn request_remove_finished_confirmation(&mut self) {
-        self.show_remove_finished_confirmation = true;
+    pub fn request_remove_all_confirmation(&mut self) {
+        self.show_remove_all_confirmation = true;
     }
 
-    pub fn confirm_remove_finished(&mut self) {
-        self.remove_finished_tasks();
-        self.show_remove_finished_confirmation = false;
+    pub fn confirm_remove_all(&mut self) {
+        self.remove_all_tasks();
+        self.show_remove_all_confirmation = false;
     }
 
-    pub fn cancel_remove_finished(&mut self) {
-        self.show_remove_finished_confirmation = false;
+    pub fn cancel_remove_all(&mut self) {
+        self.show_remove_all_confirmation = false;
     }
 
     pub fn save_edited_task(&mut self) {
@@ -683,11 +683,11 @@ impl AppState {
         self.edit_task = None;
     }
 
-    /// 工具栏「清空」：无视勾选，移除所有已结束的任务（已完成、已失败、已取消）。
+    /// 工具栏「清空」：无视勾选，移除所有任务（含等待中与进行中）。
     ///
-    /// 与 `remove_finished_tasks` 不同，这里不删任何本地文件，只把任务从列表移除。
-    pub fn clear_finished_tasks(&mut self) {
-        self.manager.send(TaskCommand::ClearFinished);
+    /// 与 `remove_all_tasks` 不同，这里不删任何本地文件，只把任务从列表移除。
+    pub fn clear_all_tasks(&mut self) {
+        self.manager.send(TaskCommand::ClearAll);
     }
 
     /// 从剪贴板粘贴任务信息，支持 `链接|文件名|请求头JSON` 的增强格式。

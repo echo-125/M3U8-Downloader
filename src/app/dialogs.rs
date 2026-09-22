@@ -366,21 +366,42 @@ pub fn render_exit_confirmation(ctx: &egui::Context, state: &mut AppState) {
 }
 
 /// 清空任务列表前的二次确认弹窗。
+///
+/// 会移除列表里全部任务（含进行中），但不删任何本地文件，因此文案强调
+/// 「中断下载」而非「删片」。进行中任务的中断提示按数量条件显示：
+/// 全是已完成任务时说「会中断下载」是误导。
 pub fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
     if !state.show_clear_confirmation {
         return;
     }
+    let active = state
+        .tasks
+        .iter()
+        .filter(|task| task.status.is_active())
+        .count();
     egui::Window::new("清空任务列表")
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .default_width(300.0)
         .show(ctx, |ui| {
-            ui.label("确定要清空任务列表吗？将移除所有已结束的任务。");
+            ui.label("确定要清空任务列表吗？将移除列表里的全部任务。");
+            if active > 0 {
+                let dark_mode = ctx.style().visuals.dark_mode;
+                ui.label(
+                    RichText::new(format!("其中 {active} 个正在进行，会中断下载"))
+                        .color(theme::status_color(dark_mode, TaskStatus::Failed)),
+                );
+            }
+            ui.label(
+                RichText::new("不删除任何本地文件，但任务本身无法恢复")
+                    .small()
+                    .weak(),
+            );
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if danger_button(ui, "清空").clicked() {
-                    state.clear_finished_tasks();
+                    state.clear_all_tasks();
                     state.show_clear_confirmation = false;
                 }
                 if ui.button("取消").clicked() {
@@ -392,18 +413,18 @@ pub fn render_clear_confirmation(ctx: &egui::Context, state: &mut AppState) {
 
 /// 工具栏「删除」的二次确认。
 ///
-/// 这个按钮无视勾选，会移除全部已结束（已完成 / 已失败 / 已取消）的任务并清掉
-/// 它们的临时分片目录，不可恢复。过去点了就直接执行，失败任务已下载的分片
-/// 一次点击就没了；这里补上与右键删除同级的确认。
+/// 这个按钮无视勾选，会移除全部任务（含进行中）并清掉它们的临时分片目录，
+/// 不可恢复。因此补上与右键删除同级的确认。
 /// 文案刻意紧凑：主文案与副说明各一行，窗口不因换行被撑高。
-pub fn render_remove_finished_confirmation(ctx: &egui::Context, state: &mut AppState) {
-    if !state.show_remove_finished_confirmation {
+pub fn render_remove_all_confirmation(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_remove_all_confirmation {
         return;
     }
-    let finished = state
+    let total = state.tasks.len();
+    let active = state
         .tasks
         .iter()
-        .filter(|task| !task.status.is_active())
+        .filter(|task| task.status.is_active())
         .count();
     egui::Window::new("删除任务")
         .collapsible(false)
@@ -411,21 +432,30 @@ pub fn render_remove_finished_confirmation(ctx: &egui::Context, state: &mut AppS
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .default_width(320.0)
         .show(ctx, |ui| {
-            ui.label(format!(
-                "确定要删除这 {finished} 个已结束（已完成/已失败/已取消）的任务吗？"
-            ));
+            ui.label(format!("确定要删除这 {total} 个任务吗？"));
+            if active > 0 {
+                let dark_mode = ctx.style().visuals.dark_mode;
+                ui.label(
+                    RichText::new(format!(
+                        "其中 {active} 个正在进行，会中断下载并删除已下载的分片"
+                    ))
+                    .color(theme::status_color(dark_mode, TaskStatus::Failed)),
+                );
+            }
+            // 「清理临时分片目录」是「删除」与「清空」的核心区别，不能只在有进行中任务时
+            // 才说：全是已完成任务时，用户看到成品不删、却不知道分片会被清掉。
             ui.label(
-                RichText::new("会清理它们的临时分片目录，成品文件保留")
+                RichText::new("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复")
                     .small()
                     .weak(),
             );
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if danger_button(ui, "删除").clicked() {
-                    state.confirm_remove_finished();
+                    state.confirm_remove_all();
                 }
                 if ui.button("取消").clicked() {
-                    state.cancel_remove_finished();
+                    state.cancel_remove_all();
                 }
             });
         });
@@ -456,8 +486,10 @@ pub fn render_delete_confirmation(ctx: &egui::Context, state: &mut AppState) {
                     .color(theme::status_color(dark_mode, TaskStatus::Failed)),
                 );
             }
+            // 「清理临时分片目录」是「删除」与「清空」的核心区别，不能只在有进行中任务时
+            // 才说：全是已完成任务时，用户看到成品不删、却不知道分片会被清掉。
             ui.label(
-                RichText::new("已完成的成品文件不会被删除，但任务本身无法恢复")
+                RichText::new("会清理这些任务的临时分片目录；成品文件保留，但任务本身无法恢复")
                     .small()
                     .weak(),
             );

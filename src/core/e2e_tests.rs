@@ -21,6 +21,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    runtime::Runtime,
     sync::{mpsc, Semaphore},
 };
 use tokio_util::sync::CancellationToken;
@@ -30,7 +31,8 @@ use crate::{
     core::{
         downloader::{run_task, DownloadTask},
         error::CoreError,
-        events::{TaskEvent, TaskSnapshot, TaskStatus},
+        events::{NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
+        manager::TaskManager,
         merge::merge_segments,
         task::{discover_task_manifests, TaskManifest},
     },
@@ -38,12 +40,15 @@ use crate::{
 
 const TS_PACKET_SIZE: usize = 188;
 
-/// 一次响应：状态码 + 响应体，可选 Retry-After 头。
+/// 一次响应：状态码 + 响应体，可选 Retry-After 头与响应体延迟。
 #[derive(Clone)]
 struct TestResponse {
     status: u16,
     body: Vec<u8>,
     retry_after: Option<String>,
+    /// 响应头发出后、写响应体之前的停顿毫秒数。用来把任务稳定停在
+    /// 「已收到 200、正在读响应体」这一刻，而不是靠本机下载速度碰运气。
+    delay_ms: u64,
 }
 
 impl TestResponse {
@@ -52,6 +57,15 @@ impl TestResponse {
             status: 200,
             body,
             retry_after: None,
+            delay_ms: 0,
+        }
+    }
+
+    /// 构造延迟发出响应体的 200 响应，用于模拟下载进行中的状态。
+    fn delayed(body: Vec<u8>, delay_ms: u64) -> Self {
+        Self {
+            delay_ms,
+            ..Self::ok(body)
         }
     }
 }
@@ -153,6 +167,7 @@ async fn serve_once(socket: &mut TcpStream, routes: &HashMap<String, TestRoute>)
             status: 404,
             body: Vec::new(),
             retry_after: None,
+            delay_ms: 0,
         },
     };
     let mut header = format!(
@@ -165,9 +180,14 @@ async fn serve_once(socket: &mut TcpStream, routes: &HashMap<String, TestRoute>)
         header.push_str(&format!("Retry-After: {value}\r\n"));
     }
     header.push_str("\r\n");
-    let mut bytes = header.into_bytes();
-    bytes.extend_from_slice(&response.body);
-    let _ = socket.write_all(&bytes).await;
+    // 响应头先发出去，再按需要停顿：客户端此时已拿到 200 并停在读响应体这一步，
+    // 这就是「下载进行中」的稳定时刻，也是删除 / 清空要处理的时刻。
+    let _ = socket.write_all(header.as_bytes()).await;
+    let _ = socket.flush().await;
+    if response.delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(response.delay_ms)).await;
+    }
+    let _ = socket.write_all(&response.body).await;
     let _ = socket.flush().await;
 }
 
@@ -1012,11 +1032,13 @@ async fn retries_segments_after_429() {
                 status: 429,
                 body: Vec::new(),
                 retry_after: Some("0".to_string()),
+                delay_ms: 0,
             },
             TestResponse {
                 status: 429,
                 body: Vec::new(),
                 retry_after: Some("0".to_string()),
+                delay_ms: 0,
             },
         ],
         fallback: TestResponse::ok(segments[0].clone()),
@@ -1117,6 +1139,204 @@ async fn rotates_keys_mid_playlist() {
         flatten(&plaintexts),
         "中间换 key 后解密结果必须仍与明文拼接一致"
     );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 轮询事件直到命中匹配项。任务管理器跑在独立运行时里，事件到达是异步的，
+/// 测试侧按短间隔轮询，超时未命中视为失败。
+fn wait_for_event<F>(manager: &TaskManager, matches: F) -> TaskEvent
+where
+    F: Fn(&TaskEvent) -> bool,
+{
+    for _ in 0..200 {
+        while let Some(event) = manager.try_recv_event() {
+            if matches(&event) {
+                return event;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("等待任务事件超时");
+}
+
+/// 轮询等待条件成立。
+///
+/// 收尾是分两步异步完成的：核心先把 `TasksRemoved` 发出来让界面立刻移除任务行，
+/// 删目录随后才做完。所以「收到事件」不等于「文件已经删完」，断言清理结果必须
+/// 按最终一致来等，直接在事件后断言会偶发假失败。
+fn wait_until<F>(description: &str, condition: F)
+where
+    F: Fn() -> bool,
+{
+    for _ in 0..200 {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("等待条件超时：{description}");
+}
+
+/// 通过管理器添加一个「等待中」任务（不自动开始），并在其临时目录里预置一个分片。
+///
+/// 等待中属于未结束状态，工具栏「删除 / 清空」必须能把它一并移除；预置分片则是
+/// 为了区分「删文件」与「保留文件」两条收尾路径。返回任务 id 与预置分片、manifest 的路径。
+fn add_waiting_task(
+    manager: &TaskManager,
+    directory: &Path,
+    name: &str,
+) -> (u64, PathBuf, PathBuf) {
+    manager.send(TaskCommand::Add(NewTask {
+        source_url: "http://127.0.0.1:1/v.m3u8".to_string(),
+        output_name: name.to_string(),
+        output_directory: directory.to_path_buf(),
+        max_workers: 4,
+        request_headers: String::new(),
+        auto_start: false,
+    }));
+    let event = wait_for_event(manager, |event| matches!(event, TaskEvent::Snapshot(_)));
+    let TaskEvent::Snapshot(snapshot) = event else {
+        unreachable!("匹配条件已限定为 Snapshot");
+    };
+    // 直接复用管理器落盘的那份清单：重新 new 会再 save 一次，只要有一个字段与管理器
+    // 写入的不同（例如并发数的默认值），测试就会悄悄把真实内容盖掉。
+    let manifest = discover_task_manifests(directory)
+        .into_iter()
+        .find(|manifest| manifest.id == snapshot.id)
+        .expect("未找到任务清单");
+    std::fs::write(manifest.segment_path(0), vec![0x47_u8; TS_PACKET_SIZE]).expect("写入分片失败");
+    (
+        snapshot.id,
+        manifest.segment_path(0),
+        manifest.manifest_path(),
+    )
+}
+
+/// 工具栏「删除」的语义：无视勾选，把等待中在内的所有任务一并移除并清掉临时分片目录。
+/// 旧实现只移除已结束任务，等待中的会漏掉——本用例防止语义被改回去。
+#[test]
+fn remove_all_takes_waiting_tasks_and_deletes_segments() {
+    let directory = temp_dir("remove-all");
+    let manager = TaskManager::new(test_settings(), directory.join("tasks.json"));
+    let (task_id, segment_path, _) = add_waiting_task(&manager, &directory, "video");
+
+    manager.send(TaskCommand::RemoveAll);
+    let event = wait_for_event(&manager, |event| {
+        matches!(event, TaskEvent::TasksRemoved { .. })
+    });
+    let TaskEvent::TasksRemoved { ids } = event else {
+        unreachable!("匹配条件已限定为 TasksRemoved");
+    };
+
+    assert_eq!(ids, vec![task_id], "等待中的任务必须一并被移除");
+    wait_until("临时分片目录被清理", || !segment_path.exists());
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 工具栏「清空」的语义：同样移除所有任务，但保留本地文件，
+/// 只给未完成任务打 dismissed 标记，避免重启后作为断点续传复活。
+#[test]
+fn clear_all_keeps_segments_but_marks_dismissed() {
+    let directory = temp_dir("clear-all");
+    let manager = TaskManager::new(test_settings(), directory.join("tasks.json"));
+    let (task_id, segment_path, manifest_path) = add_waiting_task(&manager, &directory, "video");
+
+    manager.send(TaskCommand::ClearAll);
+    let event = wait_for_event(&manager, |event| {
+        matches!(event, TaskEvent::TasksRemoved { .. })
+    });
+    let TaskEvent::TasksRemoved { ids } = event else {
+        unreachable!("匹配条件已限定为 TasksRemoved");
+    };
+
+    assert_eq!(ids, vec![task_id], "等待中的任务必须一并被清空");
+    assert!(segment_path.is_file(), "「清空」不删除任何本地文件");
+    // dismissed 标记是「不删文件」路径下防止任务复活的唯一手段：
+    // resume_tasks 载入时会跳过它，否则清理出来的空任务会带着旧分片重新入队。
+    let reloaded = TaskManifest::load(&manifest_path).expect("重新读取 manifest 失败");
+    assert!(reloaded.dismissed, "清空后任务必须打上 dismissed 标记");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 「删除」必须能中断**进行中**的下载：任务从列表移除、临时分片目录被清掉，
+/// 而且之后不再冒出这个任务的快照——核心已经不认识它了，再上报就会让界面长出幽灵行。
+///
+/// 只覆盖「等待中」是不够的：容易出问题的是正在下载的任务，它要走完整的中断路径
+/// （abort → 等协程真正退出 → 删目录）。这里让分片响应延迟发出响应体，
+/// 把任务稳定停在「已收到 200、正在读响应体」这一刻，而不是靠本机下载速度碰运气。
+///
+/// 用 `#[test]` 而不是 `#[tokio::test]`：`TaskManager` 自带运行时，在异步上下文里
+/// 创建或销毁它会 panic（tokio 不允许这样做），所以只在起服务器时临时用一次运行时。
+#[test]
+fn remove_all_interrupts_downloading_task() {
+    let directory = temp_dir("remove-downloading");
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for index in 0..4 {
+        routes.insert(
+            format!("/seg{index}.ts"),
+            TestRoute::Static(TestResponse::delayed(ts_segment(6, index as u8 + 1), 1_000)),
+        );
+    }
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 4, None).into_bytes().into(),
+    );
+    let runtime = Runtime::new().expect("创建测试运行时失败");
+    let server = runtime.block_on(TestServer::start(routes));
+
+    let manager = TaskManager::new(test_settings(), directory.join("tasks.json"));
+    manager.send(TaskCommand::Add(NewTask {
+        source_url: server.url("/video.m3u8"),
+        output_name: "video".to_string(),
+        output_directory: directory.to_path_buf(),
+        max_workers: 2,
+        request_headers: String::new(),
+        auto_start: true,
+    }));
+    // 等到真正进入下载状态，才能确保接下来打断的是一个进行中的任务。
+    let event = wait_for_event(
+        &manager,
+        |event| matches!(event, TaskEvent::Snapshot(snapshot) if snapshot.status == TaskStatus::Downloading),
+    );
+    let TaskEvent::Snapshot(snapshot) = event else {
+        unreachable!("匹配条件已限定为下载中快照");
+    };
+    let task_id = snapshot.id;
+    let task_directory = discover_task_manifests(&directory)
+        .into_iter()
+        .find(|manifest| manifest.id == task_id)
+        .expect("任务清单未落盘")
+        .task_directory();
+
+    manager.send(TaskCommand::RemoveAll);
+    let event = wait_for_event(&manager, |event| {
+        matches!(event, TaskEvent::TasksRemoved { .. })
+    });
+    let TaskEvent::TasksRemoved { ids } = event else {
+        unreachable!("匹配条件已限定为 TasksRemoved");
+    };
+    assert_eq!(ids, vec![task_id], "进行中的任务必须被移除");
+    wait_until("临时分片目录被清理", || !task_directory.exists());
+
+    // 协程收尾还需要一点时间，期间若还上报快照，界面就会重新长出这一行任务。
+    // 协程收尾还需要一点时间，期间若还上报快照，界面就会重新长出这一行任务。
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    while let Some(event) = manager.try_recv_event() {
+        if let TaskEvent::Snapshot(value) = event {
+            assert_ne!(
+                value.id, task_id,
+                "已移除的任务又上报了快照：界面会出现无法操作的幽灵行"
+            );
+        }
+    }
+
+    // 两者自带运行时，都必须在同步上下文里销毁，顺序也不能反：
+    // manager 的下载协程还在跑，先停服务器会让它卡到超时。
+    drop(manager);
+    drop(runtime);
 
     let _ = std::fs::remove_dir_all(&directory);
 }

@@ -48,16 +48,15 @@ pub fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
             .selected_ids_where(TaskStatus::is_cancelable)
             .is_empty();
         let any_startable = state.tasks.iter().any(|task| task.status.is_startable());
-        // 「删除」作用于所有已结束的任务（已完成 / 已失败 / 已取消），
+        // 「删除」与「清空」都无视勾选、作用于列表里所有任务（含进行中），
         // 与右键删除（作用于勾选）相区分，见 AGENTS.md 与 README 的行为约定。
-        let has_finished = state.tasks.iter().any(|task| !task.status.is_active());
+        let has_tasks = !state.tasks.is_empty();
         let active_count = state
             .tasks
             .iter()
             .filter(|task| task.status.is_active())
             .count();
-        let all_checked =
-            !state.tasks.is_empty() && state.selected_task_ids.len() == state.tasks.len();
+        let all_checked = has_tasks && state.selected_task_ids.len() == state.tasks.len();
 
         ui.horizontal(|ui| {
             if primary_button(ui, startable_selected, "开始").clicked() {
@@ -81,24 +80,23 @@ pub fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
             {
                 state.retry_selected_tasks();
             }
-            // 删除：无视勾选，移除所有已结束（已完成/已失败/已取消）的任务，并清掉
-            // 它们的临时分片目录（不可恢复）。因此走二次确认；右键「删除」才是
-            // 删除勾选的任务。
+            // 删除：无视勾选，移除所有任务（含进行中），并清掉它们的临时分片目录
+            // （不可恢复）。因此走二次确认；右键「删除」才是删除勾选的任务。
             if ui
-                .add_enabled(has_finished, egui::Button::new("删除"))
+                .add_enabled(has_tasks, egui::Button::new("删除"))
                 .clicked()
             {
-                state.request_remove_finished_confirmation();
+                state.request_remove_all_confirmation();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // 右上角常驻统计：进行中/总数。与状态栏「进行中」同口径（含等待中），
                 // 任务多到需要滚动时也能一眼看到规模。
-                if !state.tasks.is_empty() {
+                if has_tasks {
                     ui.label(
                         RichText::new(format!("{active_count}/{}", state.tasks.len())).strong(),
                     );
                 }
-                if !state.tasks.is_empty() && ui.button("全选").clicked() {
+                if has_tasks && ui.button("全选").clicked() {
                     // 已全部勾选时再点一次取消全选。
                     if state.selected_task_ids.len() == state.tasks.len() {
                         state.clear_checks();
@@ -106,7 +104,7 @@ pub fn render_task_list(ui: &mut egui::Ui, state: &mut AppState) {
                         state.select_all_tasks();
                     }
                 }
-                if !state.tasks.is_empty() && ui.button("清空").clicked() {
+                if has_tasks && ui.button("清空").clicked() {
                     state.show_clear_confirmation = true;
                 }
             });

@@ -89,8 +89,8 @@ pub enum TaskCommand {
     Reset(Vec<u64>),
     Retry(u64),
     Delete(u64),
-    /// 移除所有已完成和已失败的任务（界面「删除」按钮，无视勾选）。
-    RemoveFinished,
+    /// 移除所有任务（界面「删除」按钮，无视勾选）：中断进行中并清理临时分片目录。
+    RemoveAll,
     EditTask {
         id: u64,
         source_url: String,
@@ -98,7 +98,8 @@ pub enum TaskCommand {
         output_directory: String,
         request_headers: String,
     },
-    ClearFinished,
+    /// 移出所有任务（界面「清空」按钮，无视勾选）：中断进行中，但不删任何本地文件。
+    ClearAll,
     ResumeTasks(Vec<PathBuf>),
     UpdateSettings(crate::config::Settings),
     DetectFfmpeg,
