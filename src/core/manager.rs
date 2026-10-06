@@ -814,7 +814,7 @@ async fn edit_task(
     // - 被删除：由下方 TaskGone 分支清理迁移出的目录；
     // - 再次编辑：不会发生。编辑窗口是模态的，迁移完成前 GUI 不会投递第二个 EditTask。
     //   若将来新增并发投递路径（热键、拖拽等），需要先在这里占一个按任务 id 的编辑令牌。
-    let (updated, migration) = {
+    let (updated, migration, directory_changed) = {
         let Ok(mut tasks) = state.tasks.lock() else {
             return;
         };
@@ -839,11 +839,15 @@ async fn edit_task(
         let current_directory = updated.task_directory();
         let migration = (previous_directory != current_directory && previous_directory.is_dir())
             .then_some((previous_directory, current_directory));
-        (updated, migration)
+        // 注册表登记的是输出目录：目录变了要登记新目录，否则重启后的任务恢复
+        // 只扫描注册表里的旧目录加当前默认下载路径，这个任务会凭空消失。
+        let directory_changed = updated.output_directory != runtime.manifest.output_directory;
+        (updated, migration, directory_changed)
     };
 
     // 迁移完成后要判空撤销，这里先留下目标目录的副本。
     let target_directory = migration.as_ref().map(|(_, to)| to.clone());
+    let new_directory = updated.output_directory.clone();
 
     // 迁移是同步 IO，要复制的分片可能有几个 GB。必须放到阻塞线程池并释放任务锁，
     // 否则会占满 tokio worker 让其他下载任务跟着一起卡住。
@@ -873,18 +877,31 @@ async fn edit_task(
     // 只有任务在迁移期间被删除才需要清理新目录。删除任务走的是 delete_task，
     // 它清的是 manifest 里记录的旧目录，两条路径不重叠，新目录只能由这里回收。
     // 保存失败时分片已迁到新目录，绝不能撤销，否则会连分片一起删掉。
-    if matches!(
-        apply_edited_manifest(state, id, updated),
-        EditOutcome::TaskGone
-    ) {
-        // 复制出去的目录成了孤儿，清理掉并提示用户。
-        if let Some(to) = target_directory {
-            let message = match safe_remove_directory(&to) {
-                Ok(()) => "任务已不存在，迁移的分片目录已撤销".to_string(),
-                Err(error) => format!("任务已不存在，但清理迁移目录失败：{}", error.user_message()),
-            };
-            send_log_and_toast(&state.event_sender, CoreLogLevel::Warning, message);
+    match apply_edited_manifest(state, id, updated) {
+        EditOutcome::TaskGone => {
+            // 复制出去的目录成了孤儿，清理掉并提示用户。
+            if let Some(to) = target_directory {
+                let message = match safe_remove_directory(&to) {
+                    Ok(()) => "任务已不存在，迁移的分片目录已撤销".to_string(),
+                    Err(error) => {
+                        format!("任务已不存在，但清理迁移目录失败：{}", error.user_message())
+                    }
+                };
+                send_log_and_toast(&state.event_sender, CoreLogLevel::Warning, message);
+            }
         }
+        // 只有写回成功才登记新目录：保存失败时 manifest 还指着旧目录，登记新目录
+        // 只会让重启后的扫描翻进一个没有 manifest 的目录。注册表只增不删，
+        // 旧目录条目在重启扫描时找不到任务自然空转，无副作用。
+        EditOutcome::Applied if directory_changed => {
+            if let Err(error) = TaskRegistry::register(&state.task_registry_path, &new_directory) {
+                let _ = state.event_sender.send(TaskEvent::Log {
+                    level: CoreLogLevel::Warning,
+                    message: format!("任务注册表更新失败：{}", error.user_message()),
+                });
+            }
+        }
+        EditOutcome::Applied | EditOutcome::SaveFailed => {}
     }
 }
 

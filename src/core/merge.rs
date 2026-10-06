@@ -26,6 +26,9 @@ const TS_SCAN_LIMIT: usize = 10 * 1024 * 1024;
 const TS_PACKET_SIZE: usize = 188;
 /// 连续多少个同步字节才认定为合法的 TS 起始位置。
 const TS_SYNC_PACKETS: usize = 4;
+/// 最终输出 rename 换名重试的次数。覆盖「目标被播放器占用」这类常见失败，
+/// 次数过多只是把注定失败的合并拖得更久。
+const OUTPUT_RENAME_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeScanResult {
@@ -95,8 +98,8 @@ pub async fn merge_segments(
                 return Err(error);
             }
             if !convert_to_mp4 {
-                let output = unique_output_path(output_directory, output_name, "ts");
-                rename_cleaning_source(&temporary_input, &output).await?;
+                let output =
+                    finalize_output(&temporary_input, output_directory, output_name, "ts").await?;
                 return Ok(MergeResult {
                     output_path: output,
                     used_ffmpeg: false,
@@ -122,8 +125,9 @@ pub async fn merge_segments(
                     // `output` 是 ffmpeg 失败路径上的空占位文件，ffmpeg 没写入它就失败退出，
                     // 留着会污染输出目录、被手动合并扫描当成空分片，先清掉。
                     let _ = tokio::fs::remove_file(&output).await;
-                    let ts_output = unique_output_path(output_directory, output_name, "ts");
-                    rename_cleaning_source(&temporary_input, &ts_output).await?;
+                    let ts_output =
+                        finalize_output(&temporary_input, output_directory, output_name, "ts")
+                            .await?;
                     Ok(MergeResult {
                         output_path: ts_output,
                         used_ffmpeg: false,
@@ -145,8 +149,9 @@ pub async fn merge_segments(
                 )
                 .await;
             };
-            let output = unique_output_path(output_directory, output_name, "mp4");
-            // raw 中间文件同样用唯一名，避免并发同名任务撞 raw.mp4。
+            // raw 中间文件用唯一名，避免并发同名任务撞 raw.mp4。最终输出名的占位
+            // 推迟到拼接完成后再建：拼接可能跑几分钟，提前占位只会在这段窗口里
+            // 留下一个失败路径清不掉的 0 字节文件。
             let raw_output = unique_temporary_path(output_directory, "merge-raw", "mp4");
             let concatenated = match concatenate(
                 segment_paths,
@@ -160,20 +165,21 @@ pub async fn merge_segments(
                 Err(error) => Err(error),
             };
             if let Err(error) = concatenated {
-                // 拼接失败或中途取消时 raw 与 output 占位都在磁盘上，清理掉避免污染输出目录。
+                // 拼接失败或中途取消时清理 raw，避免污染输出目录。
                 let _ = tokio::fs::remove_file(&raw_output).await;
-                let _ = tokio::fs::remove_file(&output).await;
                 return Err(error);
             }
             // 直接拼接的产物缺少 moov 索引，能用 ffmpeg 时重封装一次并前置索引。
             let Some(program) = ffmpeg_program else {
-                rename_cleaning_source(&raw_output, &output).await?;
+                let output =
+                    finalize_output(&raw_output, output_directory, output_name, "mp4").await?;
                 return Ok(MergeResult {
                     output_path: output,
                     used_ffmpeg: false,
                     message: "未检测到 ffmpeg，fMP4 分片已直接拼接".into(),
                 });
             };
+            let output = unique_output_path(output_directory, output_name, "mp4");
             if let Err(error) = crate::ffmpeg::remux_faststart(program, &raw_output, &output).await
             {
                 let _ = tokio::fs::remove_file(&raw_output).await;
@@ -276,19 +282,30 @@ fn unique_temporary_path(directory: &Path, prefix: &str, extension: &str) -> Pat
     ))
 }
 
-/// 把中间文件改名为最终输出；rename 失败时清理中间文件再返回错误。
+/// 把中间文件落成最终输出：占用一个唯一名后 rename 过去。
 ///
-/// rename 失败（目标被占用、权限被拒，Windows 上播放器锁文件常见）时，source
-/// 会残留在输出目录。它带 `.cat-catch-` 隐藏前缀且扩展名是 ts/mp4，会被手动合并
-/// 扫描当成正常分片混进输出，必须清掉。
-async fn rename_cleaning_source(source: &Path, destination: &Path) -> Result<(), CoreError> {
-    match tokio::fs::rename(source, destination).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let _ = tokio::fs::remove_file(source).await;
-            Err(CoreError::Io("保存合并输出失败".into()))
+/// rename 失败（Windows 上最常见的是成品文件被播放器占用）时，0 字节占位文件
+/// 会留在输出目录并让后续合并拿不到干净原名，因此失败后先尽力清掉占位，
+/// 再换下一个唯一名重试；全部失败时清掉中间文件返回错误——中间文件带
+/// `.cat-catch-` 前缀且扩展名是 ts/mp4，残留在输出目录会被手动合并扫描
+/// 当成正常分片混进输出，必须清掉。
+async fn finalize_output(
+    temporary: &Path,
+    directory: &Path,
+    name: &str,
+    extension: &str,
+) -> Result<PathBuf, CoreError> {
+    for _ in 0..OUTPUT_RENAME_ATTEMPTS {
+        let output = unique_output_path(directory, name, extension);
+        if tokio::fs::rename(temporary, &output).await.is_ok() {
+            return Ok(output);
         }
+        // 占位文件从创建到被 rename 覆盖之间没有任何内容，删掉给下一个编号让路；
+        // 被外部进程锁定时删除同样会失败，尽力而为即可。
+        let _ = tokio::fs::remove_file(&output).await;
     }
+    let _ = tokio::fs::remove_file(temporary).await;
+    Err(CoreError::Io("保存合并输出失败".into()))
 }
 
 pub async fn scan_merge_folder(folder: &Path) -> Result<MergeScanResult, CoreError> {
@@ -712,6 +729,36 @@ mod tests {
         copy_stripping_styp(&mut File::open(&source).unwrap(), &mut output).unwrap();
         assert_eq!(output, input[16..]);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// 首选输出名被外部进程占用（Windows 上打开未共享删除位的句柄即锁死 rename）
+    /// 时，必须换下一个唯一名重试并保住内容，而不是失败并把 0 字节占位留在目录里。
+    #[tokio::test]
+    async fn finalize_output_retries_with_fresh_name_when_target_locked() {
+        let directory = temp_directory("finalize");
+        let source = directory.join(".cat-catch-merge-finalize.ts");
+        std::fs::write(&source, b"payload").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.join("video.ts"))
+            .unwrap();
+
+        let output = finalize_output(&source, &directory, "video", "ts")
+            .await
+            .expect("换名重试后应当保存成功");
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"payload");
+        // 中间文件随成功的 rename 消失，不残留可被手动合并误扫的产物。
+        assert!(!source.exists(), "中间文件应当已被 rename 走");
+        #[cfg(windows)]
+        assert_ne!(
+            output.file_name().unwrap().to_string_lossy(),
+            "video.ts",
+            "目标被占用时应换名输出而不是失败"
+        );
+        drop(locked);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     fn temp_directory(prefix: &str) -> PathBuf {

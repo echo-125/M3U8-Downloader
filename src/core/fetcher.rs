@@ -5,13 +5,16 @@ use reqwest::Response;
 use crate::config::Settings;
 use crate::core::{
     downloader::STALLED_TIMEOUT,
-    error::CoreError,
+    error::{error_chain, CoreError},
     format::{diagnostic_message, error_detail, is_error_response},
     playlist::{parse_playlist, select_best_variant, MediaPlaylist, Playlist},
     proxy::build_client,
 };
 
 const MAX_PLAYLIST_DEPTH: usize = 5;
+/// 播放列表与密钥这类小响应的体积上限：它们本该只有几 KB，
+/// 异常服务器在空闲超时的保护下也能持续灌数据，必须按体积掐断。
+const MAX_SMALL_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct PlaylistFetcher {
     client: reqwest::Client,
@@ -97,7 +100,7 @@ impl PlaylistFetcher {
             if error.is_timeout() {
                 CoreError::Timeout
             } else {
-                CoreError::Network("连接失败或响应中断".into())
+                CoreError::Network(format!("连接失败：{}", error_chain(&error)))
             }
         })?;
         Ok(response)
@@ -107,12 +110,23 @@ impl PlaylistFetcher {
 /// 播放列表和密钥都是小文件，读取超过空闲超时直接判定连接卡死。
 /// 总超时（300s）是给大分片的慢传输兜底的，卡在这类小请求上不该陪它等那么久——
 /// 任务会停在「正在解析播放列表」好几分钟，看起来像挂了。
-async fn read_small_body(response: Response) -> Result<Vec<u8>, CoreError> {
-    let bytes = tokio::time::timeout(STALLED_TIMEOUT, response.bytes())
-        .await
-        .map_err(|_| CoreError::Timeout)?
-        .map_err(|_| CoreError::Network("读取响应失败".into()))?;
-    Ok(bytes.to_vec())
+async fn read_small_body(mut response: Response) -> Result<Vec<u8>, CoreError> {
+    let mut data = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(STALLED_TIMEOUT, response.chunk())
+            .await
+            .map_err(|_| CoreError::Timeout)?
+            .map_err(|error| {
+                CoreError::Network(format!("读取响应失败：{}", error_chain(&error)))
+            })?;
+        let Some(chunk) = chunk else {
+            return Ok(data);
+        };
+        if data.len() + chunk.len() > MAX_SMALL_BODY_BYTES {
+            return Err(CoreError::Network("响应体积超过上限".into()));
+        }
+        data.extend_from_slice(&chunk);
+    }
 }
 
 /// 播放列表解码：优先响应头声明的字符集，其次 UTF-8，最后回退中文站点常见编码。

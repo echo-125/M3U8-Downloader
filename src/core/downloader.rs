@@ -17,7 +17,7 @@ use crate::{
     config::Settings,
     core::{
         decrypt::{decrypt_aes128_cbc, implicit_iv},
-        error::CoreError,
+        error::{error_chain, CoreError},
         events::{CoreLogLevel, TaskEvent, TaskSnapshot, TaskStatus},
         fetcher::PlaylistFetcher,
         format::{detect_format, diagnostic_message, SegmentFormat},
@@ -134,7 +134,7 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
             .await?;
             let data = collect_body(fetched.response)
                 .await
-                .map_err(|_| CoreError::Network("读取初始化段失败".into()))?;
+                .map_err(|error| CoreError::Network(format!("读取初始化段失败：{error}")))?;
             write_atomic(&initialization_path, &data).await?;
         }
     }
@@ -226,7 +226,12 @@ pub async fn run_task(task: DownloadTask) -> Result<TaskSnapshot, CoreError> {
 
     if settings.auto_cleanup && !settings.keep_temp {
         let task_directory = manifest.task_directory();
-        if let Err(error) = safe_remove_directory(&task_directory) {
+        // 几 GB 分片目录的删除是秒级起步的同步 IO，直接在协程里跑会占住
+        // tokio worker，拖慢所有任务的事件处理，必须放阻塞线程池。
+        let cleanup = tokio::task::spawn_blocking(move || safe_remove_directory(&task_directory))
+            .await
+            .unwrap_or_else(|_| Err(CoreError::Io("清理临时文件任务异常终止".into())));
+        if let Err(error) = cleanup {
             emit_log(
                 &event_sender,
                 CoreLogLevel::Warning,
@@ -330,7 +335,7 @@ async fn download_one_segment(
 
     let mut data = collect_body(fetched.response)
         .await
-        .map_err(|_| CoreError::Network("读取分片失败".into()))?;
+        .map_err(|error| CoreError::Network(format!("读取分片失败：{error}")))?;
 
     if let Some(encryption) = &segment.encryption {
         let key = key_cache
@@ -425,10 +430,16 @@ fn record_progress(
 async fn next_chunk<S, T, E>(stream: &mut S) -> Result<Option<T>, CoreError>
 where
     S: Stream<Item = Result<T, E>> + Unpin,
+    E: std::error::Error + 'static,
 {
     match tokio::time::timeout(STALLED_TIMEOUT, stream.next()).await {
         Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-        Ok(Some(Err(_))) => Err(CoreError::Network("下载分片中断".into())),
+        // 错误链拼到最后一环：连接被重置、TLS 握手失败这类真实原因都在
+        // source 链上，只报一句「下载分片中断」排查不了任何问题。
+        Ok(Some(Err(error))) => Err(CoreError::Network(format!(
+            "下载分片中断：{}",
+            error_chain(&error)
+        ))),
         Ok(None) => Ok(None),
         Err(_) => Err(CoreError::Timeout),
     }
@@ -593,7 +604,7 @@ async fn download_keys(
     Ok(Arc::new(cache))
 }
 
-async fn write_atomic(path: &PathBuf, data: &[u8]) -> Result<(), CoreError> {
+async fn write_atomic(path: &Path, data: &[u8]) -> Result<(), CoreError> {
     let part_path = path.with_extension("part");
     if part_path.exists() {
         tokio::fs::remove_file(&part_path)

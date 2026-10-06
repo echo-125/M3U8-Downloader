@@ -32,10 +32,11 @@ use crate::{
         downloader::{run_task, DownloadTask},
         error::CoreError,
         events::{NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
+        fetcher::PlaylistFetcher,
         manager::TaskManager,
         merge::merge_segments,
         paste::parse_inline_playlist,
-        task::{discover_task_manifests, TaskManifest},
+        task::{discover_task_manifests, TaskManifest, TaskRegistry},
     },
 };
 
@@ -588,6 +589,103 @@ async fn merge_leaves_no_empty_reservation_files() {
     }
 
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 成功后的临时目录清理放在阻塞线程池里跑，行为本身用这条用例锁定：
+/// 任务完成后任务目录（manifest、分片）必须被删干净。其余用例全部
+/// auto_cleanup=false，这条路径此前没有任何覆盖。
+#[tokio::test]
+async fn auto_cleanup_removes_task_directory() {
+    let directory = temp_dir("auto-cleanup");
+    let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(6, index as u8 + 1)).collect();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for (index, data) in segments.iter().enumerate() {
+        routes.insert(format!("/seg{index}.ts"), data.clone().into());
+    }
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 3, None).into_bytes().into(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let manifest = TaskManifest::new(
+        1,
+        &server.url("/video.m3u8"),
+        "video",
+        &directory,
+        4,
+        HashMap::new(),
+    )
+    .expect("创建任务失败");
+    let task_directory = manifest.task_directory();
+    let mut settings = test_settings();
+    settings.auto_cleanup = true;
+    let (sender, _receiver) = mpsc::unbounded_channel();
+    let snapshot = run_task(DownloadTask {
+        manifest,
+        settings,
+        event_sender: sender,
+        cancellation_token: CancellationToken::new(),
+        global_permits: Arc::new(Semaphore::new(8)),
+    })
+    .await
+    .expect("任务执行失败");
+
+    // 清理在 run_task 返回前完成，直接断言即可。
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(
+        !task_directory.exists(),
+        "任务完成后临时目录应当被清理：{}",
+        task_directory.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// send_raw 的非超时错误必须带上底层原因：只看「连接失败」一句排查不了
+/// 防盗链、DNS、证书这类问题。用「接受即断开」的监听器制造连接层失败。
+#[tokio::test]
+async fn connection_failure_carries_reason() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("绑定本地端口失败");
+    let address = listener.local_addr().expect("读取本地端口失败");
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            drop(socket);
+        }
+    });
+
+    let fetcher = PlaylistFetcher::new(&test_settings(), HashMap::new()).expect("创建抓取器失败");
+    let error = fetcher
+        .fetch_text(&format!("http://{address}/video.m3u8"))
+        .await
+        .expect_err("连接被对端断开时应当失败");
+    assert!(
+        error.to_string().contains("连接失败"),
+        "错误文案应标明连接失败并附底层原因：{error}"
+    );
+}
+
+/// 播放列表与密钥按小文件处理，超过体积上限的响应必须被掐断，
+/// 不能任由异常服务器在空闲超时的保护下持续灌数据。
+#[tokio::test]
+async fn small_body_rejects_oversized_response() {
+    // ts_segment(93_000) 约 17.5MB，超过 16MB 上限即可触发。
+    let oversized = ts_segment(93_000, 1);
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    routes.insert("/big.m3u8".to_string(), oversized.into());
+    let server = TestServer::start(routes).await;
+
+    let fetcher = PlaylistFetcher::new(&test_settings(), HashMap::new()).expect("创建抓取器失败");
+    let error = fetcher
+        .fetch_text(&server.url("/big.m3u8"))
+        .await
+        .expect_err("超过体积上限的响应应当被拒绝");
+    assert!(
+        error.to_string().contains("响应体积超过上限"),
+        "错误文案应标明体积超限：{error}"
+    );
 }
 
 #[tokio::test]
@@ -1243,7 +1341,8 @@ fn wait_for_snapshot_with_history(
 /// 就会把正在下载/合并的任务再起一份：旧运行被 abort 时合并收尾（rename、
 /// 同步清理分片目录）不会停下，成品照常落盘，新运行随后再合并一次，
 /// 输出目录就出现文件名不同、内容相同的重复成品。这里等任务真正进入下载后
-/// 重复下发开始命令，断言全程只出现一次「等待中」快照、成品只有一个。
+/// 重复下发开始命令，断言此后不再出现「等待中」快照（添加流程自带的两次
+/// 「等待中」发生在进入下载之前，不计入）、成品只有一个。
 ///
 /// 用 `#[test]` 而不是 `#[tokio::test]`，原因同 `remove_all_interrupts_downloading_task`。
 #[test]
@@ -1276,21 +1375,22 @@ fn start_while_running_does_not_restart_the_run() {
 
     // 等任务真正进入下载（响应体延迟 1 秒，此刻必然仍在传输），再重复下发开始命令，
     // 模拟用户在任务运行期间又点了「开始」和「全部开始」。
-    let (downloading, history) =
+    let (downloading, _) =
         wait_for_snapshot_with_history(&manager, Vec::new(), TaskStatus::Downloading);
     let task_id = downloading.id;
     manager.send(TaskCommand::Start(task_id));
     manager.send(TaskCommand::StartAll);
 
+    // 进入下载之后到完成之间的「等待中」快照只可能来自运行重启，一个都不该有。
     let (_completed, history) =
-        wait_for_snapshot_with_history(&manager, history, TaskStatus::Completed);
+        wait_for_snapshot_with_history(&manager, Vec::new(), TaskStatus::Completed);
     let waiting_count = history
         .iter()
         .filter(|snapshot| snapshot.status == TaskStatus::Waiting)
         .count();
     assert_eq!(
-        waiting_count, 1,
-        "运行期间重复开始不得重启任务（多次「等待中」即重启了运行）"
+        waiting_count, 0,
+        "运行期间重复开始不得重启任务（出现「等待中」即重启了运行）"
     );
 
     // 成品唯一：没有 「video (1).ts」 这类重复合并产物，也没有合并中间文件残留。
@@ -1301,16 +1401,10 @@ fn start_while_running_does_not_restart_the_run() {
     {
         let name = entry.file_name().to_string_lossy().to_string();
         if entry.path().is_dir() {
-            assert!(
-                name == ".cat-catch-tasks",
-                "输出目录出现意外目录：{name}"
-            );
+            assert!(name == ".cat-catch-tasks", "输出目录出现意外目录：{name}");
             continue;
         }
-        assert!(
-            !name.starts_with(".cat-catch-"),
-            "残留合并中间文件：{name}"
-        );
+        assert!(!name.starts_with(".cat-catch-"), "残留合并中间文件：{name}");
         if name.starts_with("video") {
             outputs.push(name);
         }
@@ -1488,7 +1582,6 @@ fn remove_all_interrupts_downloading_task() {
     wait_until("临时分片目录被清理", || !task_directory.exists());
 
     // 协程收尾还需要一点时间，期间若还上报快照，界面就会重新长出这一行任务。
-    // 协程收尾还需要一点时间，期间若还上报快照，界面就会重新长出这一行任务。
     std::thread::sleep(std::time::Duration::from_millis(300));
     while let Some(event) = manager.try_recv_event() {
         if let TaskEvent::Snapshot(value) = event {
@@ -1504,5 +1597,55 @@ fn remove_all_interrupts_downloading_task() {
     drop(manager);
     drop(runtime);
 
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 编辑任务改保存目录后必须把新目录登记进任务注册表：重启后的任务恢复只扫描
+/// 注册表里的目录加当前默认下载路径，漏登记会让任务连同断点续传一起消失。
+///
+/// 编辑只对已结束状态开放（等待中会被 is_active 拦下），因此指向必拒连接的
+/// 地址让任务快速进入「已失败」再编辑。
+#[test]
+fn edit_task_registers_new_output_directory() {
+    let directory = temp_dir("edit-registry");
+    let old_directory = directory.join("old");
+    let new_directory = directory.join("new");
+    std::fs::create_dir_all(&old_directory).expect("创建旧输出目录失败");
+    std::fs::create_dir_all(&new_directory).expect("创建新输出目录失败");
+    let registry_path = directory.join("tasks.json");
+    let manager = TaskManager::new(test_settings(), registry_path.clone());
+
+    manager.send(TaskCommand::Add(NewTask {
+        source_url: "http://127.0.0.1:1/v.m3u8".to_string(),
+        output_name: "video".to_string(),
+        output_directory: old_directory.clone(),
+        max_workers: 4,
+        request_headers: String::new(),
+        auto_start: true,
+        inline_playlist: None,
+    }));
+    wait_for_event(
+        &manager,
+        |event| matches!(event, TaskEvent::Snapshot(snapshot) if snapshot.status == TaskStatus::Failed),
+    );
+
+    manager.send(TaskCommand::EditTask {
+        id: 1,
+        source_url: "http://127.0.0.1:1/v.m3u8".to_string(),
+        output_name: "video".to_string(),
+        output_directory: new_directory.to_string_lossy().into_owned(),
+        request_headers: String::new(),
+    });
+
+    // 注册表落盘的是 canonicalize 之后的路径，比较基准保持一致。
+    let registered = new_directory.canonicalize().expect("解析新目录失败");
+    wait_until("注册表包含新输出目录", || {
+        TaskRegistry::load(&registry_path)
+            .unwrap_or_default()
+            .directories
+            .contains(&registered)
+    });
+
+    drop(manager);
     let _ = std::fs::remove_dir_all(&directory);
 }

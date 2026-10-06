@@ -66,7 +66,16 @@ pub fn build_client(
 }
 
 fn build_proxy(scheme: &ProxyScheme, host: &str, port: u16) -> Result<Proxy, CoreError> {
-    let host = host.trim_matches(|character| character == '[' || character == ']');
+    // IPv6 地址必须包上方括号才是合法 URL：先剥掉用户输入里的方括号，
+    // 再按是否含冒号统一补回，带不带括号的写法都能构建。
+    let host = host
+        .trim()
+        .trim_matches(|character| character == '[' || character == ']');
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     let scheme = match scheme {
         ProxyScheme::Http => "http",
         ProxyScheme::Https => "https",
@@ -74,4 +83,23 @@ fn build_proxy(scheme: &ProxyScheme, host: &str, port: u16) -> Result<Proxy, Cor
     };
     let url = format!("{scheme}://{host}:{port}");
     Proxy::all(url).map_err(|_| CoreError::InvalidInput("代理地址无效".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_ipv6_host_with_or_without_brackets() {
+        // IPv6 主机不带方括号拼出的 URL 非法，构建代理必然失败；两种写法都要能过。
+        assert!(build_proxy(&ProxyScheme::Http, "[::1]", 8080).is_ok());
+        assert!(build_proxy(&ProxyScheme::Http, "::1", 8080).is_ok());
+        assert!(build_proxy(&ProxyScheme::Socks5, "2001:db8::1", 1080).is_ok());
+    }
+
+    #[test]
+    fn keeps_plain_host_untouched() {
+        assert!(build_proxy(&ProxyScheme::Http, "127.0.0.1", 8080).is_ok());
+        assert!(build_proxy(&ProxyScheme::Https, "proxy.example.com", 443).is_ok());
+    }
 }

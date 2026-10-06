@@ -59,10 +59,8 @@ impl LogFile {
     }
 
     fn rotate(&mut self, date: String) {
-        if date != self.current_date {
-            self.current_date = date.clone();
-            self.current_path = self.directory.join(format!("cat-catch.{date}.log"));
-            self.written_bytes = 0;
+        let target = if date != self.current_date {
+            self.directory.join(format!("cat-catch.{date}.log"))
         } else {
             let mut index = 1;
             let mut path = self.directory.join(format!("cat-catch.{date}.{index}.log"));
@@ -70,15 +68,16 @@ impl LogFile {
                 index += 1;
                 path = self.directory.join(format!("cat-catch.{date}.{index}.log"));
             }
-            self.current_path = path;
-            self.written_bytes = 0;
-        }
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.current_path)
-        {
+            path
+        };
+        // 只有新文件真的打开成功才切换状态。打开失败时若先把 written_bytes 归零、
+        // current_path 换掉，日志会继续写进旧文件但失去再次轮转的时机；
+        // 保持旧状态则下一条日志会再次尝试轮转。
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&target) {
             self.current = file;
+            self.current_path = target;
+            self.current_date = date;
+            self.written_bytes = 0;
         }
     }
 }
