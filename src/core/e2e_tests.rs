@@ -1215,6 +1215,113 @@ fn add_waiting_task(
     )
 }
 
+/// 带历史地等待某个状态的快照：返回命中快照与之前收到的全部快照。
+/// 界面靠快照流还原任务状态变迁，重复启动这类问题只有在完整事件流里才看得出来。
+fn wait_for_snapshot_with_history(
+    manager: &TaskManager,
+    mut history: Vec<TaskSnapshot>,
+    target: TaskStatus,
+) -> (TaskSnapshot, Vec<TaskSnapshot>) {
+    for _ in 0..400 {
+        match manager.try_recv_event() {
+            Some(TaskEvent::Snapshot(snapshot)) => {
+                if snapshot.status == target {
+                    return (snapshot, history);
+                }
+                history.push(snapshot);
+            }
+            Some(_) => {}
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    panic!("等待 {:?} 快照超时", target);
+}
+
+/// 任务运行期间重复下发「开始 / 全部开始」不得重启运行。
+///
+/// 快照状态在运行全程停留在「等待中」，核心若只按快照状态判断「是否可启动」，
+/// 就会把正在下载/合并的任务再起一份：旧运行被 abort 时合并收尾（rename、
+/// 同步清理分片目录）不会停下，成品照常落盘，新运行随后再合并一次，
+/// 输出目录就出现文件名不同、内容相同的重复成品。这里等任务真正进入下载后
+/// 重复下发开始命令，断言全程只出现一次「等待中」快照、成品只有一个。
+///
+/// 用 `#[test]` 而不是 `#[tokio::test]`，原因同 `remove_all_interrupts_downloading_task`。
+#[test]
+fn start_while_running_does_not_restart_the_run() {
+    let directory = temp_dir("start-while-running");
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for index in 0..4 {
+        routes.insert(
+            format!("/seg{index}.ts"),
+            TestRoute::Static(TestResponse::delayed(ts_segment(6, index as u8 + 1), 1_000)),
+        );
+    }
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 4, None).into_bytes().into(),
+    );
+    let runtime = Runtime::new().expect("创建测试运行时失败");
+    let server = runtime.block_on(TestServer::start(routes));
+
+    let manager = TaskManager::new(test_settings(), directory.join("tasks.json"));
+    manager.send(TaskCommand::Add(NewTask {
+        source_url: server.url("/video.m3u8"),
+        output_name: "video".to_string(),
+        output_directory: directory.to_path_buf(),
+        max_workers: 2,
+        request_headers: String::new(),
+        auto_start: true,
+        inline_playlist: None,
+    }));
+
+    // 等任务真正进入下载（响应体延迟 1 秒，此刻必然仍在传输），再重复下发开始命令，
+    // 模拟用户在任务运行期间又点了「开始」和「全部开始」。
+    let (downloading, history) =
+        wait_for_snapshot_with_history(&manager, Vec::new(), TaskStatus::Downloading);
+    let task_id = downloading.id;
+    manager.send(TaskCommand::Start(task_id));
+    manager.send(TaskCommand::StartAll);
+
+    let (_completed, history) =
+        wait_for_snapshot_with_history(&manager, history, TaskStatus::Completed);
+    let waiting_count = history
+        .iter()
+        .filter(|snapshot| snapshot.status == TaskStatus::Waiting)
+        .count();
+    assert_eq!(
+        waiting_count, 1,
+        "运行期间重复开始不得重启任务（多次「等待中」即重启了运行）"
+    );
+
+    // 成品唯一：没有 「video (1).ts」 这类重复合并产物，也没有合并中间文件残留。
+    let mut outputs = Vec::new();
+    for entry in std::fs::read_dir(&directory)
+        .expect("读取输出目录失败")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.path().is_dir() {
+            assert!(
+                name == ".cat-catch-tasks",
+                "输出目录出现意外目录：{name}"
+            );
+            continue;
+        }
+        assert!(
+            !name.starts_with(".cat-catch-"),
+            "残留合并中间文件：{name}"
+        );
+        if name.starts_with("video") {
+            outputs.push(name);
+        }
+    }
+    assert_eq!(outputs, vec!["video.ts".to_string()], "成品必须恰好一个");
+
+    drop(manager);
+    drop(runtime);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// 工具栏「删除」的语义：无视勾选，把等待中在内的所有任务一并移除并清掉临时分片目录。
 /// 旧实现只移除已结束任务，等待中的会漏掉——本用例防止语义被改回去。
 #[test]

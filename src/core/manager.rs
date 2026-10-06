@@ -103,6 +103,10 @@ struct TaskRuntime {
     run_id: u64,
     cancellation_token: CancellationToken,
     handle: JoinHandle<()>,
+    /// 运行是否仍在途（排队等待槽位、下载中、合并中都算）。
+    /// 快照状态在整个运行期间停留在「等待中」，真正的进度只走事件流更新界面，
+    /// 所以判断「任务是否已在运行」必须看这个标志，不能看快照状态。
+    running: bool,
 }
 
 struct ManagerState {
@@ -327,6 +331,8 @@ fn register_idle_task(state: &ManagerState, manifest: TaskManifest, mut snapshot
                 run_id,
                 cancellation_token,
                 handle,
+                // 占位协程只等待取消，不下载任何东西，不算在途运行。
+                running: false,
             },
         );
     }
@@ -414,6 +420,9 @@ fn spawn_task(state: &ManagerState, manifest: TaskManifest, mut snapshot: TaskSn
                 run_id,
                 cancellation_token,
                 handle,
+                // 从排队等槽位起就算在途，直到 finish_task 复位；
+                // 期间重复的开始/重试命令由 start_task 拒绝。
+                running: true,
             },
         );
     }
@@ -438,6 +447,9 @@ fn finish_task(
         if runtime.run_id != run_id {
             return;
         }
+        // 无论结局如何，这次运行都不再在途；协程 panic 时走不到这里，
+        // start_task 侧用 handle.is_finished() 兜底，任务不至于从此无法启动。
+        runtime.running = false;
         let snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(CoreError::Canceled) => TaskSnapshot {
@@ -514,6 +526,14 @@ async fn start_task(state: &ManagerState, id: u64) {
         // 按 is_startable 过滤，这里是核心侧防线。等待中的任务（包括
         // auto_start=false 时 register_idle_task 登记的占位任务）由这里启动。
         if !runtime.snapshot.status.is_startable() {
+            return;
+        }
+        // 快照状态在运行全程停留在「等待中」，上面的检查拦不住真正在跑的任务，
+        // 必须再用 running 标志判一次。否则重复的开始/重试命令会 abort 掉进行中
+        // 的运行再起一个：旧运行合并收尾（rename、同步清理分片目录）不随 abort
+        // 停下，成品照常落盘，新运行接着再合并一次，输出目录就多出一份
+        // 文件名不同、内容相同的重复成品。
+        if runtime.running && !runtime.handle.is_finished() {
             return;
         }
         let manifest = runtime.manifest.clone();
