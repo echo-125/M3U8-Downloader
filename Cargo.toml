@@ -1,6 +1,6 @@
 [package]
 name = "cat-catch-assistant"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 # 包名保持 ASCII，产物名通过 [[bin]] 指定为中文。
 autobins = false
