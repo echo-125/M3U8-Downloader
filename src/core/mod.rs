@@ -2,6 +2,7 @@
 mod e2e_tests;
 
 pub mod decrypt;
+pub mod disguise;
 pub mod downloader;
 pub mod error;
 pub mod events;

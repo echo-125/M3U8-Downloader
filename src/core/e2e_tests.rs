@@ -30,6 +30,7 @@ use crate::{
     config::Settings,
     core::{
         downloader::{run_task, DownloadTask},
+        disguise::disguised_png,
         error::CoreError,
         events::{NewTask, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus},
         fetcher::PlaylistFetcher,
@@ -397,6 +398,43 @@ async fn downloads_and_merges_ts_playlist() {
         previous = value.progress;
     }
     assert!((previous - 1.0).abs() < f32::EPSILON, "最终进度应为 100%");
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// 站点把真实 TS 包进 PNG 的 roUd chunk 当图片伪装，下载层必须解包后再落盘，
+/// 否则格式检测直接判失败；合并结果必须等于解包后的 TS 拼接。
+#[tokio::test]
+async fn downloads_and_merges_disguised_png_segments() {
+    let directory = temp_dir("png-disguise");
+    let segments: Vec<Vec<u8>> = (0..3).map(|index| ts_segment(4, index as u8 + 1)).collect();
+    let mut routes: HashMap<String, TestRoute> = HashMap::new();
+    for (index, data) in segments.iter().enumerate() {
+        routes.insert(format!("/seg{index}.png"), disguised_png(0x00, data).into());
+    }
+    routes.insert(
+        "/video.m3u8".to_string(),
+        media_playlist("", 3, None)
+            .replace(".ts", ".png")
+            .into_bytes()
+            .into(),
+    );
+
+    let server = TestServer::start(routes).await;
+    let snapshot = run_download(
+        &directory,
+        &server.url("/video.m3u8"),
+        "video",
+        test_settings(),
+    )
+    .await;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let output = output_of(&snapshot);
+    assert_eq!(
+        std::fs::read(&output).expect("读取输出失败"),
+        flatten(&segments)
+    );
 
     let _ = std::fs::remove_dir_all(&directory);
 }

@@ -68,7 +68,7 @@ pub fn detect_format(data: &[u8]) -> SegmentFormat {
 }
 
 /// 对已经解压过的内容做格式检测。
-fn detect_format_decoded(data: &[u8]) -> SegmentFormat {
+pub(crate) fn detect_format_decoded(data: &[u8]) -> SegmentFormat {
     if data.first() == Some(&0x47) {
         return SegmentFormat::Ts;
     }

@@ -17,6 +17,7 @@ use crate::{
     config::Settings,
     core::{
         decrypt::{decrypt_aes128_cbc, implicit_iv},
+        disguise::extract_png_media,
         error::{error_chain, CoreError},
         events::{CoreLogLevel, TaskEvent, TaskSnapshot, TaskStatus},
         fetcher::PlaylistFetcher,
@@ -389,6 +390,15 @@ async fn download_one_segment(
 
     match detect_format(&data) {
         SegmentFormat::Ts | SegmentFormat::Fmp4 => {}
+        SegmentFormat::Image => {
+            // 部分站点把真实分片包进 PNG 图片伪装，解包成功就换回真实数据落盘，
+            // 解不开仍按图片内容报错。
+            if let Some(media) = extract_png_media(&data) {
+                data = media;
+            } else {
+                return Err(CoreError::InvalidSegment(diagnostic_message(&data)));
+            }
+        }
         _ => return Err(CoreError::InvalidSegment(diagnostic_message(&data))),
     }
 
